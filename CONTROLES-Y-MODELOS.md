@@ -23,6 +23,7 @@ La página es un port de engine-sim: la misma pantalla (vista del motor en corte
 | M / , | Capa de dibujo (cilindros más atrás) |
 | I | Mostrar potencia y par máximos |
 | Tab | Cambiar pantalla (completa, solo motor, motor + relojes) |
+| O | Vista: corte, paralela al cigüeñal o ambas (agregado del port) |
 | F | Pantalla completa |
 | Enter | Recargar el motor |
 | Arrastrar / Ctrl o Alt + rueda sobre el motor | Mover / acercar la vista (la rueda sola baja a los controles) |
@@ -32,13 +33,21 @@ Agregados del port: clic en el nombre del motor o RePág / AvPág para cambiar d
 
 ## Barra de motores y panel de controles (agregados del port)
 
-- Arriba, una barra con los motores guardados en el proyecto. Tiene seis lugares; los que todavía no tienen motor dicen "Próximamente". Para sumar uno se agrega su descripción a `ES_ENGINES` y su clave a `ES_ENGINE_ORDER` en Engine-Sim-Physics.js.
+- Arriba, una barra con los motores guardados en el proyecto y los botones de vista (Corte, Cigüeñal, Ambas). Tiene seis lugares; los que todavía no tienen motor dicen "Próximamente". Para sumar uno se agrega su descripción a `ES_ENGINES` y su clave a `ES_ENGINE_ORDER` en Engine-Sim-Physics.js.
 - Abajo de la pantalla (bajando con la rueda o con "Controles ↓"), un panel para probar en vivo:
-  - Conducción: encendido, arranque, acelerador fijo y velocidad de simulación.
+  - Conducción: encendido, arranque, acelerador fijo, velocidad de simulación y frecuencia de simulación.
   - Carga del motor: dinamómetro, mantener RPM con RPM objetivo, marcha y embrague.
   - Encendido: orden de encendido editable (mueve la chispa y las levas de cada cilindro; el cigüeñal no cambia, así que un orden que no le corresponde hace fallar el motor), bujías que se pueden apagar por cilindro y avance extra de encendido.
   - Sonido: volumen, convolución y ruidos, con el estado del audio (cola, cortes y saturación).
 - El panel y las teclas manejan el mismo estado: lo que se cambia con el teclado se ve en el panel.
+
+## Vista paralela al cigüeñal (agregado del port)
+
+Muestra el motor con el cigüeñal acostado a lo ancho: todos los cilindros a la vez, con camisas, pistones, bielas, muñequillas, la llama en cada cámara y el número de cilindro en naranja cuando enciende. Las posiciones son las de la simulación, proyectadas sobre el eje de cada bancada. En motores de dos bancadas (V o bóxer) cada bancada se dibuja de frente; según el espacio, enfrentadas sobre un mismo cigüeñal o una al lado de la otra. Por defecto se ve debajo del corte; con O o los botones de vista se elige una sola.
+
+## Frecuencia de simulación
+
+Casi todo el trabajo de la página es la física (en esta computadora, unas 20 veces lo que cuesta el sintetizador). Los motores del original piden 10 o 20 kHz; la página los corre a 8 kHz, que reduce a menos de la mitad el costo de los motores de 20 kHz y deja ralentí y torque dentro de unos pocos por ciento. En el panel se puede volver a la frecuencia original de cada motor o bajarla a 6 kHz. El sonido sale de esa misma simulación, así que con menos frecuencia suena un poco más opaco.
 
 ## Sonido
 

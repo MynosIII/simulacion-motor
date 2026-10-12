@@ -1049,6 +1049,96 @@ class ESScene {
   }
 }
 
+/* ------------------------------------------------------- Crankshaft view */
+
+// Not in engine-sim: the engine seen with the crankshaft lying across the
+// screen, so every cylinder is visible at once. Each bank is turned to face
+// the viewer. Positions are the simulator's, projected on the bank's cylinder
+// axis; journals are spaced one bore and a quarter apart.
+class ESCrankView extends ESUiElement {
+  constructor(app) { super(app); }
+  render() {
+    const app = this.app, e = app.simulator.engine, colors = app.colors, p = this.p, ctx = app.ctx, b = this.bounds;
+    this.drawFrame(b, 1, colors.foreground, colors.background);
+    const banks = e.banks.slice(0, 2), crank = e.crank, r = crank.throw;
+    const cx = crank.x || 0, cy = crank.y || 0, nJ = crank.journals.length;
+    const bore = Math.max(...banks.map(k => k.bore)), pitch = bore * 1.25, lw = bore * 0.1;
+    const headH = bore * 0.35, ch = e.pistonSpec.compressionHeight, skirt = bore * 0.45;
+    const top = Math.max(...banks.map(k => k.deckHeight + k.head.chamberVolume / k.boreArea)) + headH;
+    const inner = b.inset(14), iw = inner.width(), ih = inner.height() - 40;
+    // Two banks either face each other across one crankshaft (tall), or sit
+    // side by side, each over its own copy of it (wide); the one that draws
+    // larger in this frame wins.
+    const bankLength = nJ * pitch + pitch * 0.4, gap = pitch * 0.6, below = r * 1.8;
+    const mirrored = { w: bankLength, h: banks.length > 1 ? 2 * top : top + below };
+    const sideBySide = { w: banks.length * bankLength + (banks.length - 1) * gap, h: top + below };
+    const fit = l => Math.min(iw / l.w, ih / l.h);
+    const split = banks.length > 1 && fit(sideBySide) > fit(mirrored);
+    const lay = split ? sideBySide : mirrored, ppu = fit(lay);
+    const yMin = lay === mirrored && banks.length > 1 ? -top : -below;
+    const ox = (inner.x0 + inner.x1) / 2, oy = inner.y0 + (ih - lay.h * ppu) / 2 - yMin * ppu;
+    const grey = v => esMix(colors.background, colors.foreground, v);
+    const labels = [];
+    const shaft = x0 => {
+      const z = j => x0 + (j - (nJ - 1) / 2) * pitch;
+      p.begin(); p.line(z(0) - pitch * 0.7, 0, z(nJ - 1) + pitch * 0.7, 0, r * 0.45); p.fill(grey(0.6));
+      p.begin(); p.line(z(nJ - 1) + pitch * 0.55, -r * 1.7, z(nJ - 1) + pitch * 0.55, r * 1.7, pitch * 0.18); p.fill(grey(0.45));
+    };
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(b.x0, b.y0, b.width(), b.height()); ctx.clip();
+    ctx.translate(ox, oy); ctx.scale(ppu, ppu);
+    if (!split) shaft(0);
+
+    banks.forEach((bank, bi) => {
+      const sign = split || bi === 0 ? 1 : -1;
+      const x0 = split ? (bi - (banks.length - 1) / 2) * (bankLength + gap) : 0;
+      const z = j => x0 + (j - (nJ - 1) / 2) * pitch;
+      if (split) shaft(x0);
+      const along = (x, y) => (x - cx) * bank.dx + (y - cy) * bank.dy;
+      const h = bank.head.chamberVolume / bank.boreArea, base = along(bank.x || 0, bank.y || 0);
+      const deck = base + bank.deckHeight, roof = deck + h, liner = base + (1 - bank.displayDepth) * bank.deckHeight;
+      const js = bank.cylinders.map(c => c.journal);
+      const z0 = z(Math.min(...js)) - pitch / 2, z1 = z(Math.max(...js)) + pitch / 2;
+      // Cylinder head across the bank.
+      p.begin(); p.line(z0, sign * (roof + headH / 2), z1, sign * (roof + headH / 2), headH); p.fill(grey(0.3));
+      for (const cyl of bank.cylinders) {
+        const i = cyl.global, x = z(cyl.journal), chamber = e.chambers[i];
+        const pin = along(cyl.pinX, cyl.pinY), crankPin = along(cyl.journalX, cyl.journalY);
+        const wall = bank.bore / 2 + lw / 2;
+        // Liner walls.
+        p.begin();
+        p.line(x - wall, sign * liner, x - wall, sign * roof, lw);
+        p.line(x + wall, sign * liner, x + wall, sign * roof, lw);
+        p.fill(colors.pink);
+        // Crank web and counterweight, then the crank pin.
+        p.begin(); p.line(x, -sign * r * 0.75, x, sign * crankPin, bank.bore * 0.32); p.fill(grey(0.7));
+        p.begin(); p.circle(x, sign * crankPin, r * 0.32); p.fill(grey(0.8));
+        // Connecting rod.
+        p.begin(); p.line(x, sign * crankPin, x, sign * pin, r * 0.45); p.fill(grey(0.9333));
+        // Flame between the crown and the head.
+        const crown = pin + ch;
+        if (chamber.lit) {
+          const depth = Math.min(chamber.flame.travelY, roof - crown), width = Math.min(chamber.flame.travelX * 2, bank.bore);
+          p.begin(); p.line(x, sign * roof, x, sign * (roof - depth), width); p.fill(colors.orange.slice(0, 3).concat([0.6]));
+        }
+        // Piston and wrist pin.
+        p.begin(); p.line(x, sign * (pin - skirt), x, sign * crown, bank.bore * 0.96); p.fill(colors.foreground);
+        p.begin(); p.circle(x, sign * pin, bank.bore / 10 * 0.75); p.fill(colors.background);
+        labels.push([String(i + 1), ox + x * ppu, oy + sign * (roof + headH + bore * 0.12) * ppu + (sign > 0 ? 0 : -18), chamber.lit]);
+      }
+    });
+    ctx.restore();
+    for (const [t, x, y, lit] of labels) {
+      const w = p.textWidth(t, 18);
+      p.text(t, x - w / 2, y, 18, lit ? colors.orange : colors.foreground);
+    }
+    this.drawText('CRANKSHAFT VIEW', b.inset(10), 16);
+    const order = app.simulator.firingOrder().map(i => i + 1).join('-');
+    this.drawAlignedText('FIRING ORDER ' + order, b.inset(10), 16, [1, 1], [1, 1]);
+  }
+}
+
 /* ------------------------------------------------------------ Audio output */
 
 // The synthesizer's audio thread runs in an AudioWorklet. Its classes are
@@ -1113,6 +1203,11 @@ function esDecodeInt16(base64) {
 // controls below it, so the engine can be driven without the keyboard. They
 // write the same state the keys do, and show what the keys changed.
 const ES_ENGINE_BAR_SLOTS = 6;
+// The engines ask for 10 or 20 kHz; the page runs them at 8 kHz by default,
+// which halves the physics cost of the 20 kHz engines with the same torque
+// and idle within a few percent. 0 keeps each engine's own rate.
+const ES_DEFAULT_SIM_FREQUENCY = 8000;
+const ES_SIM_FREQUENCIES = [[0, 'Original del motor'], [12000, '12 kHz'], [10000, '10 kHz'], [8000, '8 kHz · liviana'], [6000, '6 kHz · muy liviana']];
 const ES_SIM_SPEEDS = [[1, 'Tiempo real'], [1 / 10, '1/10'], [1 / 100, '1/100'], [1 / 200, '1/200'], [1 / 500, '1/500'], [1 / 1000, '1/1000']];
 
 function esEl(tag, attrs = {}, children = []) {
@@ -1139,10 +1234,15 @@ class ESEngineBar {
       list.append(esEl('button', { type: 'button', class: 'engine', disabled: '' },
         [esEl('span', { class: 'engine-name', text: 'Próximamente' }), esEl('span', { class: 'engine-meta', text: 'Motor ' + (i + 1) })]));
     }
-    host.append(list, esEl('a', { class: 'to-controls', href: '#controls', text: 'Controles ↓' }));
+    this.views = ['Corte', 'Cigüeñal', 'Ambas'].map((t, i) => esEl('button', { type: 'button', text: t, onclick: () => app.setViewMode(i) }));
+    const views = esEl('div', { class: 'views', role: 'group', 'aria-label': 'Vista · O' }, [esEl('span', { text: 'Vista' }), ...this.views]);
+    host.append(list, views, esEl('a', { class: 'to-controls', href: '#controls', text: 'Controles ↓' }));
     this.update();
   }
-  update() { this.buttons.forEach((b, i) => b.setAttribute('aria-selected', String(i === this.app.engineIndex))); }
+  update() {
+    this.buttons.forEach((b, i) => b.setAttribute('aria-selected', String(i === this.app.engineIndex)));
+    this.views.forEach((b, i) => b.setAttribute('aria-pressed', String(i === this.app.viewMode)));
+  }
 }
 
 function esEngineSummary(spec) {
@@ -1175,10 +1275,16 @@ class ESControlPanel {
     this.throttle = range('Acelerador', 0, 100, 1, 0, v => { this.app.panel.throttle = v / 100; }, v => v + ' %');
     this.simSpeed = esEl('select', { onchange: () => { this.app.panel.simSpeed = +this.simSpeed.value; } },
       ES_SIM_SPEEDS.map(([v, t]) => esEl('option', { value: v, text: t })));
+    this.simFrequency = esEl('select', { onchange: () => this.app.setSimulationFrequency(+this.simFrequency.value) },
+      ES_SIM_FREQUENCIES.map(([v, t]) => esEl('option', { value: v, text: t })));
+    this.simFrequency.value = this.app.panel.simFrequency;
+    this.simFrequencyOut = esEl('output');
     const drive = group('Conducción', 'Q, W, E y R aceleran mientras se mantienen. El acelerador de acá queda fijo.', [
       esEl('div', { class: 'buttons' }, [this.ignition, this.starter]),
       this.throttle.row,
       esEl('label', { class: 'row' }, [esEl('span', { text: 'Velocidad de simulación' }), this.simSpeed, esEl('output')]),
+      esEl('label', { class: 'row' }, [esEl('span', { text: 'Frecuencia de simulación' }), this.simFrequency, this.simFrequencyOut]),
+      esEl('p', { class: 'hint', text: 'Es la frecuencia de la física, y de ella sale el sonido. Más baja pesa menos para la computadora y suena un poco más opaca.' }),
     ]);
 
     // Load
@@ -1208,7 +1314,7 @@ class ESControlPanel {
     this.plugs = esEl('div', { class: 'plugs' });
     this.advance = range('Avance extra', -20, 20, 1, 0, v => { this.app.panel.timingOffset = v; this.app.simulator.ignitionModule.timingOffset = v * ES_UNITS.deg; }, v => (v > 0 ? '+' : '') + v + '°');
     const ignition = group('Encendido', 'Cambiar el orden mueve la chispa y las levas de cada cilindro. Apagá bujías para escuchar un cilindro muerto.', [
-      esEl('div', { class: 'row' }, [esEl('span', { text: 'Orden de encendido' }), esEl('div', { class: 'order' }, [this.order,
+      esEl('div', { class: 'row stack' }, [esEl('span', { text: 'Orden de encendido' }), esEl('div', { class: 'order' }, [this.order,
         esEl('button', { type: 'button', text: 'Aplicar', onclick: applyOrder }),
         esEl('button', { type: 'button', text: 'Original', onclick: () => { this.order.value = this.defaultOrder; applyOrder(); } })])]),
       this.orderNote,
@@ -1270,6 +1376,7 @@ class ESControlPanel {
     press(this.dyno, sim.dyno.enabled);
     press(this.hold, sim.dyno.hold);
     if (document.activeElement !== this.gear) this.gear.value = t.gear;
+    this.simFrequencyOut.textContent = Math.round(sim.simulationFrequency) + ' Hz';
     for (const [name, r] of Object.entries(this.audioRanges)) if (document.activeElement !== r.input && +r.input.value !== app.audioParams[name]) { r.input.value = app.audioParams[name]; r.show(); }
     const torque = sim.filteredDynoTorque() / ES_UNITS.lbft, power = sim.dynoPower() / 745.699872;
     this.readout.textContent = `${Math.abs(e.rpm()).toFixed(0)} rpm · ${(e.manifoldPressure() / 1000).toFixed(0)} kPa` +
@@ -1300,10 +1407,13 @@ class ESApp {
     this.mouse = [0, 0]; this.mouseDown = false; this.mousePressed = false; this.mouseReleased = false; this.wheel = 0;
     this.lastMouseWheel = 0; this.uiLastScroll = 0; this.hover = null; this.dragStart = null; this.mouse0 = [0, 0];
     this.audio = null; this.levelerGain = 1; this.oscillatorSampleOffset = 0;
-    this.panel = { throttle: 0, starter: false, clutch: 1, simSpeed: 1, timingOffset: 0 };
+    this.panel = { throttle: 0, starter: false, clutch: 1, simSpeed: 1, timingOffset: 0, simFrequency: ES_DEFAULT_SIM_FREQUENCY };
 
     this.root = new ESUiElement(this);
     this.engineView = this.root.add(new ESEngineView(this));
+    this.crankView = this.root.add(new ESCrankView(this));
+    // 0: cross-section (the original), 1: crankshaft view, 2: both.
+    this.viewMode = 2;
     this.rightGaugeCluster = this.root.add(new ESRightGaugeCluster(this));
     this.oscCluster = this.root.add(new ESOscilloscopeCluster(this));
     this.performanceCluster = this.root.add(new ESPerformanceCluster(this));
@@ -1330,6 +1440,7 @@ class ESApp {
     this.synthInput = new ESSynthesizerInput(spec.exhausts.length);
     this.simulator = new ESSimulator(spec, this.synthInput);
     const e = this.simulator.engine;
+    if (this.panel.simFrequency) this.simulator.setSimulationFrequency(this.panel.simFrequency);
     this.layer0 = 0; this.layer1 = e.crank.journals.length;
     this.audioParams = {
       volume: 1, convolution: 1, dF_F_mix: e.hfGain, inputSampleNoise: e.jitter, inputSampleNoiseFrequencyCutoff: 10000,
@@ -1380,6 +1491,12 @@ class ESApp {
   setDynoSpeed(w) {
     const e = this.simulator.engine;
     this.dynoSpeed = esClamp(w, e.dynoMinSpeed, e.dynoMaxSpeed);
+  }
+  setSimulationFrequency(f) {
+    this.panel.simFrequency = f;
+    const sim = this.simulator;
+    sim.setSimulationFrequency(f || sim.engine.simulationFrequency);
+    this.infoCluster.setLogMessage('Set simulation freq to ' + sim.simulationFrequency.toFixed(0));
   }
   setGear(gear) {
     const t = this.simulator.transmission;
@@ -1648,6 +1765,20 @@ class ESApp {
       this.rightGaugeCluster.bounds = esGrid(win, 3, 1, 2, 0);
       for (const el of all) el.visible = el === this.engineView || el === this.rightGaugeCluster;
     }
+    // The crankshaft view takes the engine view's place, or its lower part.
+    const area = this.engineView.bounds, crank = this.crankView;
+    crank.visible = this.viewMode !== 0;
+    if (this.viewMode === 1) { crank.bounds = area; this.engineView.visible = false; }
+    else if (this.viewMode === 2) {
+      const split = area.y0 + area.height() * 0.45;
+      crank.bounds = new ESBounds(area.x0, area.y0, area.x1, split);
+      this.engineView.bounds = new ESBounds(area.x0, split, area.x1, area.y1);
+    }
+  }
+  setViewMode(mode) {
+    this.viewMode = mode;
+    this.infoCluster.setLogMessage(['CROSS-SECTION VIEW', 'CRANKSHAFT VIEW', 'CROSS-SECTION + CRANKSHAFT VIEW'][mode]);
+    if (this.engineBar) this.engineBar.update();
   }
   renderScene() {
     const ctx = this.ctx, s = this.pixelScale;
@@ -1657,7 +1788,7 @@ class ESApp {
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
     // y up, origin at the bottom left, in the original's pixel units.
     ctx.setTransform(s, 0, 0, -s, 0, this.height * s);
-    this.scene.render(this.engineView);
+    if (this.engineView.visible) this.scene.render(this.engineView);
     this.root.render();
     if (!this.audio) this.renderStartPrompt();
     this.painter.flushText();
@@ -1681,6 +1812,7 @@ class ESApp {
     if (this.keyPressed('PageUp')) this.nextEngine(-1);
     if (this.keyPressed('PageDown')) this.nextEngine(1);
     if (this.keyPressed('Tab')) this.screen = (this.screen + 1) % 3;
+    if (this.keyPressed('KeyO')) this.setViewMode((this.viewMode + 1) % 3);
     if (this.keyPressed('KeyF')) {
       if (!document.fullscreenElement) { document.documentElement.requestFullscreen().catch(() => { }); this.infoCluster.setLogMessage('Entered fullscreen mode'); }
       else { document.exitFullscreen(); this.infoCluster.setLogMessage('Exited fullscreen mode'); }
