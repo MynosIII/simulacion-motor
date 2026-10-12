@@ -1,12 +1,12 @@
-// Copies Engine-Sim-Core.js and Engine-Sim-Physics.js into Engine-Lab-Local.html,
-// so the page keeps working as a single offline file.
+// Copies the engine-sim port into Engine-Lab-Local.html, so the page keeps
+// working as a single offline file.
 //   node tools/inline-scripts.js          update the HTML
 //   node tools/inline-scripts.js --check  fail if the HTML is out of date
 const fs = require('fs');
 const path = require('path');
 const root = path.join(__dirname, '..');
 const htmlPath = path.join(root, 'Engine-Lab-Local.html');
-const files = ['Engine-Sim-Core.js', 'Engine-Sim-Physics.js'];
+const files = ['Engine-Sim-Assets.js', 'Engine-Sim-Physics.js', 'Engine-Sim-UI.js'];
 
 let html = fs.readFileSync(htmlPath, 'utf8');
 const original = html;

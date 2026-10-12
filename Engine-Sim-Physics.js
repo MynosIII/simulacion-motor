@@ -1,24 +1,18 @@
 /* Engine-Sim-Physics.js
- * JavaScript port of the engine-sim simulation core, Copyright 2022 AngeTheGreat
- * (Ange Yaghi), MIT. Source: https://github.com/ange-yaghi/engine-sim
- * commit 85f7c3b959a908ed5232ede4f1a4ac7eafe6b630. See PROCEDENCIA.md.
+ * JavaScript port of the engine-sim simulation core and synthesizer,
+ * Copyright 2022 AngeTheGreat (Ange Yaghi), MIT.
+ * Source: https://github.com/ange-yaghi/engine-sim, commit 85f7c3b959a908ed5232ede4f1a4ac7eafe6b630.
+ * See PROCEDENCIA.md.
  *
- * Ported closely: GasSystem (src/gas_system.cpp), CombustionChamber
- * (src/combustion_chamber.cpp), Intake (src/intake.cpp), ExhaustSystem
- * (src/exhaust_system.cpp), Fuel (src/fuel.cpp), IgnitionModule
- * (src/ignition_module.cpp), PistonEngineSimulator::simulateStep_ and
- * writeToSynthesizer (src/piston_engine_simulator.cpp) and Synthesizer
- * (src/synthesizer.cpp) with its filters.
+ * Ported closely: GasSystem, CombustionChamber, Intake, ExhaustSystem, Fuel,
+ * Camshaft and the harmonic cam lobe, StandardValvetrain and VtecValvetrain,
+ * IgnitionModule, StarterMotor, Dynamometer, Transmission, Vehicle, the
+ * Simulator frame and step loop, PistonEngineSimulator::writeToSynthesizer and
+ * the Synthesizer with its filters, convolution and leveler.
  *
- * Replaced: the original solves crank, rods and pistons as rigid bodies with
- * the scs constraint solver. Here the crank is a single degree of freedom and
- * pistons follow exact slider-crank kinematics, which is equivalent for rigid
- * links. Rod mass is split between the crank pin and the piston. Starter, dyno,
- * clutch and vehicle drag keep the original torque limits but are solved as
- * sequential impulses instead of constraints.
+ * Replaced: the scs rigid body solver. See ESEngine and
+ * ESSimulator.processRigidBodies for what stands in for it.
  */
-'use strict';
-
 const ES_R = 8.31446261815324;
 const ES_AIR_MOLAR_MASS = 0.02897;
 const ES_ATM = 101325;
@@ -27,7 +21,7 @@ const ES_TAU = 2 * Math.PI;
 const ES_FOUR_PI = 4 * Math.PI;
 const ES_UNITS = {
   inch: 0.0254, thou: 0.0000254, mm: 0.001, cm: 0.01, cc: 1e-6, L: 1e-3, cm2: 1e-4,
-  g: 0.001, lb: 0.45359237, lbft: 0.3048 * 4.44822, rpm: 0.104719755,
+  g: 0.001, lb: 0.45359237, lbft: 0.3048 * 4.44822, rpm: 0.104719755, mph: 0.44704, psi: 6894.757293168,
   scfm: 0.002641 * 453.59237 / 60, inHg: 3386.3886666666713, deg: Math.PI / 180,
 };
 ES_UNITS.inH2O = ES_UNITS.inHg * 0.0734824;
@@ -275,9 +269,9 @@ function esFlow(k, dt, dirX, dirY, area0, area1, s0, s1) {
   if (source.E < 0) source.E = 0;
   return flow * direction;
 }
-
 /* ------------------------------------------------------- Intake and exhaust */
 
+// Intake (src/intake.cpp).
 class ESIntake {
   constructor(p) {
     this.p = p;
@@ -289,37 +283,39 @@ class ESIntake {
     this.atmosphere.setGeometry(100, 100, 1, 0);
     this.inputK = esKCarb(p.flowRate); this.idleK = esKCarb(p.idleFlowRate || 0);
     this.runnerK = esKCarb(p.runnerFlowRate);
-    this.throttle = 1; // throttle plate linkage position (1 = closed)
-    this.molecularAfr = 12.5; this.afrScale = 1;
-    this.flow = 0; this.flowAccumulator = 0; this.fuelInjected = 0;
+    this.molecularAfr = p.molecularAfr || 12.5;
+    this.idlePlate = p.idlePlate;
+    this.throttle = 1;
+    this.flow = 0; this.flowRate = 0; this.totalFuelInjected = 0;
   }
-  platePosition() { return this.p.idlePlate * this.throttle; }
+  throttlePlatePosition() { return this.idlePlate * this.throttle; }
   process(dt) {
-    const idealAfr = 0.8 * this.molecularAfr * 4 * this.afrScale;
+    const idealAfr = 0.8 * this.molecularAfr * 4;
     const pAir = idealAfr / (1 + idealAfr);
-    const attenuation = Math.cos(this.platePosition() * Math.PI / 2);
+    const pIdleAir = 2 / 3;
+    const attenuation = Math.cos(this.throttlePlatePosition() * Math.PI / 2);
     this.atmosphere.reset(ES_ATM, ES_T25, 1 - pAir, pAir * 0.75, pAir * 0.25);
     this.flow = esFlow(attenuation * this.inputK, dt, 0, -1, 10, this.p.plenumArea, this.atmosphere, this.system);
+    let idle = 0;
     if (this.idleK !== 0) {
-      const pIdle = 2 / 3;
-      this.atmosphere.reset(ES_ATM, ES_T25, 1 - pIdle, pIdle * 0.75, pIdle * 0.25);
-      const idle = esFlow(this.idleK, dt, 0, -1, 10, this.p.plenumArea, this.atmosphere, this.system);
-      if (idle > 0) this.fuelInjected += (1 - pIdle) * idle;
+      this.atmosphere.reset(ES_ATM, ES_T25, 1 - pIdleAir, pIdleAir * 0.75, pIdleAir * 0.25);
+      idle = esFlow(this.idleK, dt, 0, -1, 10, this.p.plenumArea, this.atmosphere, this.system);
     }
     this.system.dissipateExcessVelocity();
     this.system.updateVelocity(dt, this.p.velocityDecay);
-    if (this.flow > 0) this.fuelInjected += (1 - pAir) * this.flow;
-    this.flowAccumulator += this.flow;
+    if (this.flow > 0) this.totalFuelInjected += (1 - pAir) * this.flow;
+    if (idle > 0) this.totalFuelInjected += (1 - pIdleAir) * idle;
   }
 }
 
+// ExhaustSystem (src/exhaust_system.cpp).
 class ESExhaustSystem {
-  constructor(p, length, audioVolume) {
-    this.p = p; this.length = length; this.audioVolume = audioVolume;
-    const volume = p.collectorArea * length;
+  constructor(p, index) {
+    this.p = p; this.index = index;
+    this.length = p.length; this.audioVolume = p.audioVolume; this.impulseResponse = p.impulseResponse;
     this.system = new ESGasSystem();
-    this.system.initialize(ES_ATM, volume, ES_T25);
-    this.system.setGeometry(length, Math.sqrt(p.collectorArea), 1, 0);
+    this.system.initialize(ES_ATM, p.collectorArea * p.length, ES_T25);
+    this.system.setGeometry(p.length, Math.sqrt(p.collectorArea), 1, 0);
     this.atmosphere = new ESGasSystem();
     this.atmosphere.initialize(ES_ATM, 1000, ES_T25);
     this.atmosphere.setGeometry(10, 10, 1, 0);
@@ -335,9 +331,10 @@ class ESExhaustSystem {
 
 /* ---------------------------------------------------------------------- Fuel */
 
+// Fuel (src/fuel.cpp) with the defaults of the fuel node in es/objects/objects.mr.
 class ESFuel {
   constructor(p = {}) {
-    this.molecularMass = 0.1; this.energyDensity = 48.1e6; this.molecularAfr = 12.5;
+    this.molecularMass = 0.1; this.energyDensity = 48.1e6; this.density = 0.755; this.molecularAfr = 12.5;
     this.burningEfficiencyRandomness = 0.5; this.lowEfficiencyAttenuation = 0.6;
     this.maxBurningEfficiency = 0.8; this.maxTurbulenceEffect = 2.0; this.maxDilutionEffect = 10.0;
     Object.assign(this, p);
@@ -359,100 +356,163 @@ class ESFuel {
 
 /* --------------------------------------------------------------- Valvetrain */
 
-// GenerateHarmonicCamLobeNode::_evaluate (scripting/include/actions.h), tabulated.
-function esHarmonicLobeTable(durationDeg, lift, gamma = 1.1, steps = 256) {
-  const thou50 = 50 * ES_UNITS.thou;
-  const angle = durationDeg * ES_UNITS.deg / 4;
-  const s = Math.pow(2 * thou50 / lift, 1 / gamma) - 1;
-  const k = Math.acos(s) / angle, extents = Math.PI / k;
-  const N = 2048, xs = new Float64Array(N), ys = new Float64Array(N);
-  for (let i = 0; i < N; i++) {
-    const x = -Math.PI + ES_TAU * i / (N - 1), ax = Math.abs(x);
-    xs[i] = x;
-    ys[i] = ax >= extents ? 0 : lift * Math.pow(0.5 + 0.5 * Math.cos(k * ax), gamma);
+// GenerateHarmonicCamLobeNode::_evaluate (scripting/include/actions.h): the same
+// samples, read back with Function::sampleTriangle, which for a filter radius
+// equal to the spacing is linear interpolation clamped at the ends.
+function esHarmonicCamLobe(p) {
+  const steps = p.steps || 100, gamma = p.gamma, lift = p.lift;
+  const angle = p.duration / 4;
+  const s = Math.pow(2 * 50 * ES_UNITS.thou / lift, 1 / gamma) - 1;
+  const k = Math.acos(s) / angle, extents = Math.PI / k, step = extents / (steps - 5);
+  const n = 2 * steps - 1, xs = new Float64Array(n), ys = new Float64Array(n);
+  for (let i = 0; i < steps; i++) {
+    const x = i * step, y = x >= extents ? 0 : lift * Math.pow(0.5 + 0.5 * Math.cos(k * x), gamma);
+    xs[steps - 1 + i] = x; ys[steps - 1 + i] = y;
+    xs[steps - 1 - i] = -x; ys[steps - 1 - i] = y;
   }
-  return new ESTable(xs, ys);
+  const table = new ESTable(xs, ys);
+  table.lift = lift;
+  return table;
+}
+
+// Camshaft (src/camshaft.cpp). Lobe centerlines are given in crank angle.
+class ESCamshaft {
+  constructor(engine, p) {
+    this.engine = engine;
+    this.advance = p.advance || 0; this.baseRadius = p.baseRadius;
+    this.lobeProfile = esHarmonicCamLobe(p.lobe);
+    this.lobeAngles = p.lobes.map(a => a / 2);
+  }
+  angle() { return esMod((this.engine.crankAngle() + this.advance) * 0.5, ES_TAU); }
+  sampleLobe(theta) {
+    let t = esMod(theta, ES_TAU);
+    if (t >= Math.PI) t -= ES_TAU;
+    return this.lobeProfile.sample(t);
+  }
+  valveLift(lobe) { return this.sampleLobe(this.angle() + this.lobeAngles[lobe]); }
+}
+
+// StandardValvetrain and VtecValvetrain (src/vtec_valvetrain.cpp).
+class ESValvetrain {
+  constructor(engine, p) {
+    this.engine = engine;
+    this.intakeCamshaft = new ESCamshaft(engine, p.intakeCam);
+    this.exhaustCamshaft = new ESCamshaft(engine, p.exhaustCam);
+    if (p.vtec) {
+      this.vtec = p.vtec;
+      this.vtecIntakeCamshaft = new ESCamshaft(engine, p.vtec.intakeCam);
+      this.vtecExhaustCamshaft = new ESCamshaft(engine, p.vtec.exhaustCam);
+    }
+  }
+  isVtecEnabled() {
+    const v = this.vtec, e = this.engine;
+    return !!v && e.manifoldPressure() > v.manifoldVacuum && e.speed() > v.minRpm && (1 - e.throttle) > v.minThrottlePosition;
+  }
+  activeIntakeCamshaft() { return this.isVtecEnabled() ? this.vtecIntakeCamshaft : this.intakeCamshaft; }
+  activeExhaustCamshaft() { return this.isVtecEnabled() ? this.vtecExhaustCamshaft : this.exhaustCamshaft; }
+  intakeValveLift(i) { return this.activeIntakeCamshaft().valveLift(i); }
+  exhaustValveLift(i) { return this.activeExhaustCamshaft().valveLift(i); }
 }
 
 /* ------------------------------------------------------- Combustion chamber */
 
+const ES_STATE_SAMPLES = 256;
+
+// CombustionChamber (src/combustion_chamber.cpp).
 class ESChamber {
-  constructor(engine, index) {
-    const spec = engine.spec;
-    this.engine = engine; this.index = index; this.number = index + 1;
+  constructor(engine, cylinder) {
+    this.engine = engine; this.cylinder = cylinder;
+    this.bank = cylinder.bank; this.head = cylinder.bank.head;
     this.system = new ESGasSystem(); this.intakeRunner = new ESGasSystem(); this.exhaustRunner = new ESGasSystem();
-    this.lit = false; this.flame = { travelX: 0, travelY: 0, lastVolume: 0, efficiency: 1, flameSpeed: 0, fuel: 0, o2: 0, totalN: 0 };
+    this.lit = false; this.litLastFrame = false;
+    this.flame = { travelX: 0, travelY: 0, lastVolume: 0, efficiency: 1, flameSpeed: 0, fuel: 0, o2: 0 };
     this.intakeK = 0; this.exhaustK = 0; this.intakeLift = 0; this.exhaustLift = 0;
-    this.exhaustFlow = 0; this.stepIntakeFlow = 0; this.stepExhaustFlow = 0;
-    this.blowbyK = esK28((spec.blowby && spec.blowby[index]) || 0);
-    this.soundAttenuation = (spec.soundAttenuation && spec.soundAttenuation[index]) || 1;
-    this.headerLength = (spec.primaryLengths && spec.primaryLengths[index]) || 0;
-    this.sparkTimer = 0;
+    this.exhaustFlow = 0; this.lastTimestepExhaustFlow = 0; this.lastTimestepIntakeFlow = 0;
+    this.blowbyK = esK28(cylinder.blowby || 0);
+    this.pistonSpeedSamples = new Float64Array(ES_STATE_SAMPLES);
+    this.pressureSamples = new Float64Array(ES_STATE_SAMPLES);
   }
   initialize() {
-    const e = this.engine, spec = e.spec, head = spec.head;
-    this.exhaust = e.exhaustFor(this.index);
-    const volume = e.chamberVolumeAt(this.index);
-    const area = e.boreArea;
+    const e = this.engine, head = this.head, cyl = this.cylinder;
+    this.intake = e.intake; this.exhaust = cyl.exhaust;
+    this.area = this.bank.boreArea;
+    const volume = this.volume();
     this.system.initialize(ES_ATM, volume, ES_T25);
-    this.system.setGeometry(Math.sqrt(area), volume / area, 1, 0);
-    const iArea = head.intakeRunnerArea, iVol = head.intakeRunnerVolume + iArea * spec.intake.runnerLength;
+    this.system.setGeometry(Math.sqrt(this.area), volume / this.area, 1, 0);
+    const iArea = head.intakeRunnerArea, iVol = head.intakeRunnerVolume + iArea * this.intake.p.runnerLength;
     this.intakeRunner.initialize(ES_ATM, iVol, ES_T25);
     this.intakeRunner.setGeometry(iVol / iArea, Math.sqrt(iArea), 1, 0);
     const eArea = head.exhaustRunnerArea;
-    const eVol = head.exhaustRunnerVolume + eArea * (spec.exhaust.primaryTubeLength + this.headerLength);
+    const eVol = head.exhaustRunnerVolume + eArea * (this.exhaust.p.primaryTubeLength + cyl.primaryLength);
     this.exhaustRunner.initialize(ES_ATM, eVol, ES_T25);
     this.exhaustRunner.setGeometry(eVol / eArea, Math.sqrt(eArea), 1, 0);
   }
+  // CombustionChamber::getVolume: the piston position s is along the bank axis.
+  volume() {
+    const piston = this.engine.pistonSpec, cyl = this.cylinder;
+    return this.area * (this.bank.deckHeight - cyl.s - piston.compressionHeight)
+      + this.head.chamberVolume - (piston.displacement || 0);
+  }
+  popLitLastFrame() { const lit = this.litLastFrame; this.litLastFrame = false; return lit; }
+  pistonSpeed() { return this.cylinder.ds * this.engine.omega; }
+  meanPistonSpeed() { let s = 0; for (const v of this.pistonSpeedSamples) s += v; return s / ES_STATE_SAMPLES; }
+  updateCycleStates() {
+    const i = Math.round(this.engine.cycleAngle() / ES_FOUR_PI * (ES_STATE_SAMPLES - 1));
+    this.pistonSpeedSamples[i] = Math.abs(this.pistonSpeed());
+    this.pressureSamples[i] = this.system.pressure();
+  }
   ignite() {
-    if (this.lit || this.system.fuel === 0) return;
-    const e = this.engine, fuel = e.fuel, sys = this.system;
+    const sys = this.system;
+    if (this.lit || sys.fuel === 0) return;
+    const fuel = this.engine.fuel;
     const afr = sys.o2 / sys.fuel, equivalence = afr / fuel.molecularAfr;
     if (equivalence < 0.5 || equivalence > 1.9) return;
     const dilution = sys.inert / (sys.o2 / 0.7) - 1;
     const f = this.flame;
-    f.lastVolume = sys.V; f.travelX = 0; f.travelY = 0; f.totalN = sys.n; f.fuel = sys.fuel; f.o2 = sys.o2;
-    this.lit = true; this.sparkTimer = 0.03;
-    const turbulence = e.turbulence.sample(e.meanPistonSpeed());
+    f.lastVolume = this.volume(); f.travelX = 0; f.travelY = 0; f.fuel = sys.fuel; f.o2 = sys.o2;
+    this.lit = true; this.litLastFrame = true;
+    const turbulence = this.engine.meanPistonSpeedToTurbulence.sample(this.meanPistonSpeed());
     const mixing = 1 - esClamp(turbulence / fuel.maxTurbulenceEffect) * esClamp(1 - dilution / fuel.maxDilutionEffect);
     const r = fuel.lowEfficiencyAttenuation * ((1 - fuel.burningEfficiencyRandomness) + fuel.burningEfficiencyRandomness * Math.random());
     f.efficiency = (mixing * r + (1 - mixing)) * fuel.maxBurningEfficiency;
     f.flameSpeed = fuel.flameSpeed(turbulence, afr, sys.temperature(), sys.pressure());
   }
   update() {
-    const e = this.engine;
-    this.system.setVolume(e.chamberVolumeAt(this.index));
-    this.intakeLift = e.intakeLift(this.index); this.exhaustLift = e.exhaustLift(this.index);
-    this.intakeK = e.intakePortFlow.sample(this.intakeLift);
-    this.exhaustK = e.exhaustPortFlow.sample(this.exhaustLift);
+    const head = this.head, index = this.cylinder.index;
+    this.system.setVolume(this.volume());
+    this.updateCycleStates();
+    this.intakeLift = head.valvetrain.intakeValveLift(index);
+    this.exhaustLift = head.valvetrain.exhaustValveLift(index);
+    this.intakeK = head.intakePortFlow.sample(this.intakeLift);
+    this.exhaustK = head.exhaustPortFlow.sample(this.exhaustLift);
   }
   flow(dt) {
-    const e = this.engine, spec = e.spec, sys = this.system, intake = e.intake, exhaust = this.exhaust;
-    const volume = sys.V, area = e.boreArea, height = volume / area;
-    const surface = height * Math.PI * spec.bore + area * 2;
+    const sys = this.system, intake = this.intake, exhaust = this.exhaust, head = this.head;
+    const volume = this.volume(), area = this.area, height = volume / area;
+    const surface = height * Math.PI * this.bank.bore + area * 2;
     sys.changeEnergy((363.15 - sys.temperature()) * surface * 100 * dt);
     if (this.blowbyK !== 0) sys.flowToEnvironment(this.blowbyK, dt, ES_ATM, ES_T25);
 
-    const iArea = spec.head.intakeRunnerArea, eArea = spec.head.exhaustRunnerArea;
-    esFlow(intake.runnerK, dt, 1, 0, spec.intake.plenumArea, iArea, intake.system, this.intakeRunner);
+    const iArea = head.intakeRunnerArea, eArea = head.exhaustRunnerArea;
+    esFlow(intake.runnerK, dt, 1, 0, intake.p.plenumArea, iArea, intake.system, this.intakeRunner);
     this.intakeRunner.dissipateExcessVelocity();
     const intakeFlow = esFlow(this.intakeK, dt, 1, 0, iArea, volume / height, this.intakeRunner, sys);
     this.intakeRunner.dissipateExcessVelocity(); sys.dissipateExcessVelocity();
     const exhaustFlow = esFlow(this.exhaustK, dt, 1, 0, volume / height, eArea, sys, this.exhaustRunner);
     sys.dissipateExcessVelocity(); this.exhaustRunner.dissipateExcessVelocity();
-    esFlow(exhaust.primaryK, dt, 1, 0, eArea, spec.exhaust.collectorArea, this.exhaustRunner, exhaust.system);
+    esFlow(exhaust.primaryK, dt, 1, 0, eArea, exhaust.p.collectorArea, this.exhaustRunner, exhaust.system);
 
-    this.intakeRunner.updateVelocity(dt, spec.intake.velocityDecay);
+    this.intakeRunner.updateVelocity(dt, intake.p.velocityDecay);
     sys.updateVelocity(dt, 0.5);
-    this.exhaustRunner.updateVelocity(dt, spec.exhaust.velocityDecay);
+    this.exhaustRunner.updateVelocity(dt, exhaust.p.velocityDecay);
 
     if (Math.abs(intakeFlow) > 1e-9 && this.lit) this.lit = false;
     this.exhaustFlow = exhaustFlow;
-    this.stepExhaustFlow += exhaustFlow; this.stepIntakeFlow += intakeFlow;
+    this.lastTimestepExhaustFlow += exhaustFlow; this.lastTimestepIntakeFlow += intakeFlow;
 
     if (this.lit) {
       const f = this.flame;
-      const totalX = spec.bore / 2, totalY = volume / area;
+      const totalX = this.bank.bore / 2, totalY = volume / area;
       const lastX = f.travelX, lastY = f.travelY * (volume / f.lastVolume);
       f.travelX = Math.min(lastX + dt * f.flameSpeed, totalX);
       f.travelY = Math.min(lastY + dt * f.flameSpeed, totalY);
@@ -461,406 +521,852 @@ class ESChamber {
         const previous = lastX * lastX * Math.PI * lastY;
         const n = ((burned - previous) / volume) * sys.n;
         const fuelBurned = sys.react(n * f.efficiency, f.fuel, f.o2);
-        sys.changeEnergy(fuelBurned * e.fuel.molecularMass * e.fuel.energyDensity);
+        sys.changeEnergy(fuelBurned * this.engine.fuel.molecularMass * this.engine.fuel.energyDensity);
       } else this.lit = false;
       f.lastVolume = volume;
     }
   }
+  // CombustionChamber::calculateFrictionForce with the default friction model.
+  frictionForce(vs, wallForce) {
+    const Fcoul = 0.06 * wallForce, vst = 0.1 * Math.SQRT2, vcoul = 0.1 / 10, Fbrk = 50;
+    const v = Math.abs(vs), F1 = v / vst;
+    return Math.SQRT2 * Math.E * (Fbrk - Fcoul) * Math.exp(-F1 * F1) * F1 + Fcoul * Math.tanh(v / vcoul) + 20 * v;
+  }
+}
+
+/* ------------------------------------------------------------------- Engine */
+
+// Engine, Crankshaft, CylinderBank, Piston, ConnectingRod and CylinderHead as one
+// object built from a description that mirrors the .mr engine scripts.
+//
+// The original solves crankshaft, rods and pistons as rigid bodies held by
+// constraints. Rigid links leave a single degree of freedom, so here the
+// crankshaft angle drives exact kinematics of every piston and rod, and the
+// equation of motion uses the configuration-dependent inertia
+//   I(θ) = I_crank + Σ m_p s'² + m_r |r_cm'|² + I_r ψ'²
+// with I(θ) ω' + ½ I'(θ) ω² = τ. Angles follow engine-sim: the crankshaft body
+// angle θ, getAngle() = θ - tdc and getCycleAngle() = mod(-getAngle(), 4π).
+class ESEngine {
+  constructor(spec) {
+    this.spec = spec;
+    const crank = spec.crankshaft;
+    this.name = spec.name;
+    this.redline = spec.redline; this.starterTorque = spec.starterTorque; this.starterSpeed = spec.starterSpeed;
+    this.dynoMinSpeed = spec.dynoMinSpeed ?? 1000 * ES_UNITS.rpm;
+    this.dynoMaxSpeed = spec.dynoMaxSpeed ?? spec.redline;
+    this.dynoHoldStep = spec.dynoHoldStep ?? 100 * ES_UNITS.rpm;
+    this.throttleGamma = spec.throttleGamma ?? 1;
+    this.simulationFrequency = spec.simulationFrequency ?? 10000;
+    this.hfGain = spec.hfGain ?? 0.01; this.jitter = spec.jitter ?? 0.5; this.noise = spec.noise ?? 1.0;
+    this.fuel = new ESFuel(spec.fuel);
+    this.pistonSpec = spec.piston; this.rodSpec = spec.rod;
+    this.crank = crank;
+    this.theta = 0; this.omega = 0; this.alpha = 0;
+    this.throttle = 1; this.speedControl = 0;
+    this.meanPistonSpeedToTurbulence = new ESTable(Array.from({ length: 30 }, (_, i) => i), Array.from({ length: 30 }, (_, i) => 0.5 * i));
+    this.intake = new ESIntake(spec.intake);
+    this.exhausts = spec.exhausts.map((p, i) => new ESExhaustSystem(p, i));
+
+    const lifts = n => Array.from({ length: n }, (_, i) => i * 50 * ES_UNITS.thou);
+    this.banks = spec.banks.map((b, index) => {
+      const head = Object.assign({}, spec.head, b.head || {});
+      const bank = {
+        index, angle: b.angle, bore: b.bore ?? spec.bore, deckHeight: b.deckHeight ?? spec.deckHeight,
+        x: b.x || 0, y: b.y || 0, displayDepth: b.displayDepth ?? 0.5,
+        cylinders: [], head,
+      };
+      bank.dx = Math.cos(bank.angle + Math.PI / 2); bank.dy = Math.sin(bank.angle + Math.PI / 2);
+      bank.boreArea = Math.PI * bank.bore * bank.bore / 4;
+      head.flipDisplay = !!b.flip;
+      head.intakePortFlow = new ESTable(lifts(head.intakeFlow.length), head.intakeFlow.map(esK28));
+      head.exhaustPortFlow = new ESTable(lifts(head.exhaustFlow.length), head.exhaustFlow.map(esK28));
+      head.valvetrain = new ESValvetrain(this, b.valvetrain);
+      return bank;
+    });
+    this.cylinders = [];
+    spec.banks.forEach((b, bi) => b.cylinders.forEach((c, ci) => {
+      const cyl = {
+        global: this.cylinders.length, index: ci, bank: this.banks[bi],
+        journal: c.journal, journalAngle: crank.journals[c.journal],
+        wire: c.wire, exhaust: this.exhausts[c.exhaust || 0],
+        primaryLength: c.primaryLength || 0, soundAttenuation: c.soundAttenuation ?? 1, blowby: c.blowby || 0,
+        s: 0, ds: 0, dds: 0, rodTheta: 0, dpsi: 0, pinX: 0, pinY: 0, journalX: 0, journalY: 0,
+      };
+      this.banks[bi].cylinders.push(cyl);
+      this.cylinders.push(cyl);
+    }));
+    this.chambers = this.cylinders.map(c => new ESChamber(this, c));
+    this.maxDepth = Math.max(...this.cylinders.map(c => c.journal)) + 1;
+    this.computeGeometry();
+    for (const ch of this.chambers) ch.initialize();
+    this.displacement = this.calculateDisplacement();
+  }
+
+  // Exact slider-crank kinematics for every cylinder at the current angle, with
+  // first and second derivatives against θ. Fills this.inertia and this.dInertia.
+  computeGeometry() {
+    const crank = this.crank, r = crank.throw, L = this.rodSpec.length;
+    const mp = this.pistonSpec.mass, mr = this.rodSpec.mass, Ir = this.rodSpec.momentOfInertia;
+    const cx = crank.x || 0, cy = crank.y || 0, theta = this.theta;
+    let I = crank.momentOfInertia, dI = 0;
+    for (const c of this.cylinders) {
+      const bank = c.bank, ux = bank.dx, uy = bank.dy;
+      const phi = theta + c.journalAngle, jx = r * Math.cos(phi), jy = r * Math.sin(phi);
+      const wx = cx + jx - bank.x, wy = cy + jy - bank.y;
+      const w1x = -jy, w1y = jx, w2x = -jx, w2y = -jy;
+      const a = ux * wx + uy * wy, a1 = ux * w1x + uy * w1y, a2 = ux * w2x + uy * w2y;
+      const ww = wx * wx + wy * wy, q = Math.sqrt(Math.max(L * L - ww + a * a, 1e-12));
+      const wdw = wx * w1x + wy * w1y;
+      const q1 = (-wdw + a * a1) / q;
+      const q2 = (-(w1x * w1x + w1y * w1y + wx * w2x + wy * w2y) + a1 * a1 + a * a2 - q1 * q1) / q;
+      const s = a + q, s1 = a1 + q1, s2 = a2 + q2;
+      // Rod: d = P - J, its centre of mass at the midpoint (center_of_mass is 0 in every engine here).
+      const dx = s * ux - wx, dy = s * uy - wy;
+      const d1x = s1 * ux - w1x, d1y = s1 * uy - w1y, d2x = s2 * ux - w2x, d2y = s2 * uy - w2y;
+      const psi1 = (dx * d1y - dy * d1x) / (L * L), psi2 = (dx * d2y - dy * d2x) / (L * L);
+      const r1x = 0.5 * (s1 * ux + w1x), r1y = 0.5 * (s1 * uy + w1y);
+      const r2x = 0.5 * (s2 * ux + w2x), r2y = 0.5 * (s2 * uy + w2y);
+      I += mp * s1 * s1 + mr * (r1x * r1x + r1y * r1y) + Ir * psi1 * psi1;
+      dI += 2 * (mp * s1 * s2 + mr * (r1x * r2x + r1y * r2y) + Ir * psi1 * psi2);
+      c.s = s; c.ds = s1; c.dds = s2;
+      c.journalX = cx + jx; c.journalY = cy + jy;
+      c.pinX = bank.x + s * ux; c.pinY = bank.y + s * uy;
+      c.rodTheta = Math.atan2(dy, dx) - Math.PI / 2;
+      c.cosRod = (dx * ux + dy * uy) / L; c.sinRod = (dx * uy - dy * ux) / L;
+    }
+    this.inertia = I; this.dInertia = dI;
+  }
+
+  // Engine::calculateDisplacement, numerically like the original.
+  calculateDisplacement() {
+    const theta = this.theta, min = this.cylinders.map(() => Infinity), max = this.cylinders.map(() => -Infinity);
+    for (let j = 0; j < 1000; j++) {
+      this.theta = ES_TAU * j / 1000; this.computeGeometry();
+      this.cylinders.forEach((c, i) => { min[i] = Math.min(min[i], c.s); max[i] = Math.max(max[i], c.s); });
+    }
+    this.theta = theta; this.computeGeometry();
+    return this.cylinders.reduce((sum, c, i) => sum + c.bank.boreArea * (max[i] - min[i]), 0);
+  }
+
+  // Generalized torque of the gas and piston friction forces on the crankshaft.
+  pistonTorque() {
+    const w = this.omega, alpha = this.alpha, mp = this.pistonSpec.mass;
+    let tau = 0;
+    for (const ch of this.chambers) {
+      const c = ch.cylinder, A = ch.area;
+      const force = -A * (ch.system.pressure() - ES_ATM);
+      const vs = c.ds * w;
+      // Cylinder wall reaction from the rod, standing in for the line constraint force.
+      const as = c.dds * w * w + c.ds * alpha;
+      const rodForce = (mp * as - force) / (Math.abs(c.cosRod) > 1e-6 ? c.cosRod : 1e-6);
+      const wall = Math.abs(rodForce * c.sinRod);
+      const attenuation = Math.min(Math.abs(vs), 1e-3) / 1e-3;
+      const F = ch.frictionForce(vs, wall) * attenuation;
+      tau += (force + (vs > 0 ? -F : F)) * c.ds;
+    }
+    return tau;
+  }
+
+  crankAngle() { return this.theta - this.crank.tdc; }
+  cycleAngle(offset = 0) { return esMod(-this.crankAngle() + offset, ES_FOUR_PI); }
+  isSpinningCw() { return this.omega <= 0; }
+  speed() { return Math.abs(this.omega); }
+  rpm() { return Math.abs(this.omega) / ES_UNITS.rpm; }
+  setSpeedControl(s) { this.speedControl = s; this.throttleLinkage = 1 - Math.pow(s, this.throttleGamma); }
+  update() { this.throttle = this.throttleLinkage ?? 1; this.intake.throttle = this.throttle; }
+  manifoldPressure() { return this.intake.system.pressure(); }
+  throttlePlateAngle() { return (1 - this.intake.throttlePlatePosition()) * (Math.PI / 2); }
+  intakeFlowRate() { return this.intake.flowRate; }
+  intakeAfr() {
+    const s = this.intake.system, o2 = s.o2 * s.n, fuel = s.fuel * s.n;
+    return fuel === 0 ? 0 : (0.0319988 * o2 / 0.21) / (fuel * 0.11423);
+  }
+  exhaustO2() {
+    let inert = 0, o2 = 0, fuel = 0;
+    for (const e of this.exhausts) { const s = e.system; inert += s.inert * s.n; o2 += s.o2 * s.n; fuel += s.fuel * s.n; }
+    return fuel === 0 ? 0 : (0.0319988 * o2) / (fuel * 0.11423 + 0.028014 * inert + 0.0319988 * o2);
+  }
+  totalFuelMassConsumed() { return this.intake.totalFuelInjected * this.fuel.molecularMass; }
+  totalVolumeFuelConsumed() { return this.totalFuelMassConsumed() / this.fuel.density / 1000; }
+}
+
+/* ------------------------------------------------------------------ Ignition */
+
+// IgnitionModule (src/ignition_module.cpp).
+class ESIgnitionModule {
+  constructor(engine, p) {
+    this.engine = engine;
+    this.timingCurve = new ESTable(p.timing.map(t => t[0]), p.timing.map(t => t[1]));
+    this.revLimit = p.revLimit; this.limiterDuration = p.limiterDuration;
+    this.plugs = engine.cylinders.map(c => ({ angle: p.wires[c.wire], enabled: true, ignitionEvent: false }));
+    this.enabled = false; this.revLimitTimer = 0;
+    this.lastCrankshaftAngle = engine.cycleAngle();
+  }
+  timingAdvance() { return this.timingCurve.sample(-this.engine.omega); }
+  update(dt) {
+    const e = this.engine, cycleAngle = e.cycleAngle();
+    if (this.enabled && this.revLimitTimer === 0) {
+      const advance = this.timingAdvance();
+      for (const plug of this.plugs) {
+        let adjusted = esMod(plug.angle - advance, ES_FOUR_PI);
+        const r0 = this.lastCrankshaftAngle;
+        let r1 = cycleAngle;
+        if (e.omega < 0) {
+          if (r1 < r0) { r1 += ES_FOUR_PI; adjusted += ES_FOUR_PI; }
+          if (adjusted >= r0 && adjusted < r1) plug.ignitionEvent = plug.enabled;
+        } else {
+          if (r1 > r0) { r1 -= ES_FOUR_PI; adjusted -= ES_FOUR_PI; }
+          if (adjusted >= r1 && adjusted < r0) plug.ignitionEvent = plug.enabled;
+        }
+      }
+    }
+    this.revLimitTimer -= dt;
+    if (Math.abs(e.omega) > this.revLimit) this.revLimitTimer = this.limiterDuration;
+    if (this.revLimitTimer < 0) this.revLimitTimer = 0;
+    this.lastCrankshaftAngle = cycleAngle;
+  }
+  resetIgnitionEvents() { for (const p of this.plugs) p.ignitionEvent = false; }
+}
+
+/* ------------------------------------------------- Vehicle and transmission */
+
+// Vehicle (src/vehicle.cpp) and Transmission (src/transmission.cpp). The
+// transmission output is a rotating mass whose inertia stands for the car.
+class ESVehicle {
+  constructor(p) { Object.assign(this, p); this.travelledDistance = 0; }
+}
+class ESTransmission {
+  constructor(p, vehicle, rotatingMass) {
+    this.gearRatios = p.gears; this.maxClutchTorque = p.maxClutchTorque;
+    this.vehicle = vehicle; this.rotatingMass = rotatingMass;
+    this.gear = -1; this.clutchPressure = 0;
+  }
+  changeGear(newGear) {
+    if (newGear < -1 || newGear >= this.gearRatios.length) return;
+    if (newGear !== -1) {
+      const v = this.vehicle, m = this.rotatingMass;
+      const f = v.tireRadius / (v.diffRatio * this.gearRatios[newGear]);
+      const newI = v.mass * f * f, E = 0.5 * m.I * m.v * m.v;
+      m.v = (m.v < 0 ? -1 : 1) * Math.sqrt(E * 2 / newI);
+      m.I = newI; m.m = v.mass;
+    }
+    this.gear = newGear;
+  }
+}
+
+/* ---------------------------------------------------------------- Simulator */
+
+const ES_DYNO_TORQUE_SAMPLES = 512;
+
+class ESDelayFilter {
+  constructor(delay, sampleRate) {
+    this.latency = Math.round(delay * sampleRate);
+    this.buffer = new Float64Array(this.latency + 1); this.write = 0; this.size = 0;
+  }
+  f(x) {
+    const n = this.buffer.length;
+    this.buffer[this.write] = x; this.write = (this.write + 1) % n;
+    if (this.size <= this.latency) { this.size++; if (this.size <= this.latency) return 0; }
+    return this.buffer[this.write];
+  }
+}
+
+// Simulator + PistonEngineSimulator (src/simulator.cpp, src/piston_engine_simulator.cpp).
+class ESSimulator {
+  constructor(spec, synthesizerInput) {
+    this.engine = new ESEngine(spec);
+    this.vehicle = new ESVehicle(spec.vehicle);
+    this.vehicleMass = { I: 1, m: 1, v: 0 };
+    this.transmission = new ESTransmission(spec.transmission, this.vehicle, this.vehicleMass);
+    this.ignitionModule = new ESIgnitionModule(this.engine, spec.ignition);
+    this.starterMotor = { enabled: false, maxTorque: this.engine.starterTorque, rotationSpeed: -this.engine.starterSpeed };
+    this.dyno = { enabled: false, hold: false, rotationSpeed: 0, maxTorque: 10000 * ES_UNITS.lbft, torque: 0 };
+    this.simulationFrequency = this.engine.simulationFrequency;
+    this.simulationSpeed = 1;
+    this.fluidSimulationSteps = 8;
+    this.targetSynthesizerLatency = 0.1;
+    this.filteredEngineSpeed = 0;
+    this.dynoTorqueSamples = new Float64Array(ES_DYNO_TORQUE_SAMPLES);
+    this.lastDynoTorqueSample = 0;
+    this.steps = 0; this.currentIteration = 0;
+    this.delayFilters = this.engine.cylinders.map(c => new ESDelayFilter((c.primaryLength + c.exhaust.length) / 343, 10000));
+    this.exhaustFlowStaging = new Float64Array(this.engine.exhausts.length);
+    this.synthesizerInput = synthesizerInput || null;
+    if (this.synthesizerInput) this.synthesizerInput.setInputSampleRate(this.simulationFrequency);
+    this.physicsProcessingTime = 0;
+  }
+  timestep() { return 1 / this.simulationFrequency; }
+  setSimulationFrequency(f) { this.simulationFrequency = f; }
+
+  // Simulator::startFrame: the synthesizer input latency steers how many steps run.
+  startFrame(dt, latency) {
+    if (this.synthesizerInput) this.synthesizerInput.setInputSampleRate(this.simulationFrequency * this.simulationSpeed);
+    this.currentIteration = 0;
+    let steps = Math.round(dt * this.simulationSpeed / this.timestep());
+    if (latency !== undefined) {
+      if (latency < this.targetSynthesizerLatency) steps = Math.trunc((steps + 1) * 1.1);
+      else if (latency > this.targetSynthesizerLatency) steps = Math.max(0, Math.trunc((steps - 1) * 0.9));
+    }
+    this.steps = steps;
+    if (steps > 0) this.engine.intake.flowRate = 0;
+    return steps;
+  }
+
+  // atg_scs::RigidBodySystem::process reduced to one degree of freedom plus the
+  // vehicle's rotating mass. Constraints are velocity constraints with torque
+  // limits solved by projected Gauss-Seidel, like the original's limits.
+  processRigidBodies(dt) {
+    const e = this.engine, vm = this.vehicleMass, t = this.transmission, v = this.vehicle;
+    e.computeGeometry();
+    const I = e.inertia, w0 = e.omega;
+    let wc = w0 + dt * (e.pistonTorque() - 0.5 * e.dInertia * w0 * w0) / I;
+    let wv = vm.v;
+
+    const st = this.starterMotor, dy = this.dyno, cons = this._constraints || (this._constraints = Array.from({ length: 5 }, () => ({})));
+    const set = (k, jc, jv, target, lo, hi) => { const c = cons[k]; c.jc = jc; c.jv = jv; c.target = target; c.lo = lo * dt; c.hi = hi * dt; c.lambda = 0; c.mEff = 1 / (jc * jc / I + jv * jv / vm.I); };
+    // Starter motor (src/starter_motor.cpp).
+    if (st.rotationSpeed < 0) set(0, 1, 0, st.rotationSpeed, st.enabled ? -st.maxTorque : 0, 0);
+    else set(0, 1, 0, st.rotationSpeed, 0, st.enabled ? st.maxTorque : 0);
+    // Dynamometer (src/dynamometer.cpp).
+    const max = dy.maxTorque;
+    if (w0 < 0) set(1, 1, 0, -dy.rotationSpeed, (dy.hold && dy.enabled) ? -max : 0, dy.enabled ? max : 0);
+    else set(1, 1, 0, dy.rotationSpeed, dy.enabled ? -max : 0, (dy.hold && dy.enabled) ? max : 0);
+    // Crankshaft friction (RotationFrictionConstraint).
+    set(2, 1, 0, 0, -e.crank.frictionTorque, e.crank.frictionTorque);
+    // Clutch (ClutchConstraint) between the crankshaft and the vehicle mass.
+    const clutch = t.gear === -1 ? 0 : t.maxClutchTorque * t.clutchPressure;
+    set(3, 1, -1, 0, -clutch, clutch);
+    // Vehicle drag (VehicleDragConstraint), converted to a virtual torque.
+    const speed = Math.sqrt(vm.I / v.mass) * Math.abs(wv);
+    const rho = ES_AIR_MOLAR_MASS * ES_ATM / (ES_R * ES_T25);
+    const drag = Math.sqrt(vm.I / v.mass) * (v.rollingResistance + 0.5 * rho * speed * speed * v.dragCoefficient * v.crossSectionArea);
+    set(4, 0, 1, 0, -drag, drag);
+
+    for (let iter = 0; iter < 8; iter++) {
+      for (const c of cons) {
+        if (c.lo === 0 && c.hi === 0) continue;
+        const vel = c.jc * wc + c.jv * wv;
+        const prev = c.lambda;
+        c.lambda = esClamp(prev + (c.target - vel) * c.mEff, c.lo, c.hi);
+        const dl = c.lambda - prev;
+        wc += c.jc * dl / I; wv += c.jv * dl / vm.I;
+      }
+    }
+    const dynoTorque = cons[1].lambda / dt;
+    dy.torque = wc > 0 ? -dynoTorque : dynoTorque;
+    this.starterTorque = cons[0].lambda / dt;
+    e.alpha = (wc - w0) / dt;
+    e.omega = wc; vm.v = wv;
+    e.theta += wc * dt;
+    // Crankshaft::resetAngle
+    e.theta = e.theta % ES_FOUR_PI;
+    e.computeGeometry();
+  }
+
+  // PistonEngineSimulator::endFrame: the intake flow summed over the frame becomes a rate.
+  endFrame() {
+    const t = this.steps * this.timestep();
+    if (t > 0) this.engine.intake.flowRate /= t;
+  }
+
+  vehicleSpeed() { const vm = this.vehicleMass; return Math.sqrt(vm.I * vm.v * vm.v / this.vehicle.mass); }
+
+  simulateStep() {
+    if (this.currentIteration >= this.steps) return false;
+    const dt = this.timestep(), e = this.engine;
+    this.processRigidBodies(dt);
+    e.update(dt);
+    this.vehicle.travelledDistance += this.vehicleSpeed() * dt;
+
+    const alpha = dt / (100 + dt);
+    this.filteredEngineSpeed = alpha * this.filteredEngineSpeed + (1 - alpha) * e.rpm();
+
+    const index = Math.min(ES_DYNO_TORQUE_SAMPLES - 1, Math.floor(ES_DYNO_TORQUE_SAMPLES * e.cycleAngle() / ES_FOUR_PI));
+    const step = e.isSpinningCw() ? 1 : -1;
+    const torque = this.dyno.torque, samples = this.dynoTorqueSamples;
+    samples[index] = torque;
+    if (this.lastDynoTorqueSample !== index) {
+      for (let i = this.lastDynoTorqueSample + step; i !== index; i += step) {
+        if (i >= ES_DYNO_TORQUE_SAMPLES) { i = -1; continue; }
+        else if (i < 0) { i = ES_DYNO_TORQUE_SAMPLES; continue; }
+        samples[i] = torque;
+      }
+      this.lastDynoTorqueSample = index;
+    }
+
+    this.simulateStep_(dt);
+    this.writeToSynthesizer();
+    this.currentIteration++;
+    return true;
+  }
+
+  simulateStep_(dt) {
+    const e = this.engine, im = this.ignitionModule;
+    im.update(dt);
+    for (let i = 0; i < e.chambers.length; i++) {
+      if (im.plugs[i].ignitionEvent) e.chambers[i].ignite();
+      e.chambers[i].update();
+    }
+    for (const ch of e.chambers) { ch.lastTimestepExhaustFlow = 0; ch.lastTimestepIntakeFlow = 0; }
+    const fluidDt = dt / this.fluidSimulationSteps;
+    for (let k = 0; k < this.fluidSimulationSteps; k++) {
+      for (const ex of e.exhausts) ex.process(fluidDt);
+      e.intake.process(fluidDt);
+      e.intake.flowRate += e.intake.flow;
+      for (const ch of e.chambers) ch.flow(fluidDt);
+    }
+    im.resetIgnitionEvents();
+  }
+
+  writeToSynthesizer() {
+    const e = this.engine, staging = this.exhaustFlowStaging, n = e.cylinders.length;
+    staging.fill(0);
+    const attenuation = Math.min(Math.abs(this.filteredEngineSpeed), 40) / 40, att3 = attenuation ** 3;
+    for (let i = 0; i < n; i++) {
+      const c = e.cylinders[i], ch = e.chambers[i], er = ch.exhaustRunner;
+      const exhaustLength = c.primaryLength + c.exhaust.length;
+      const flow = att3 * 1600 * ((er.pressure() - ES_ATM) + 0.1 * er.dynamicPressure(1, 0) + 0.1 * er.dynamicPressure(-1, 0));
+      const delayed = this.delayFilters[i].f(flow);
+      staging[c.exhaust.index] += c.soundAttenuation * (c.exhaust.audioVolume * delayed / n) / (exhaustLength * exhaustLength);
+    }
+    if (this.synthesizerInput) this.synthesizerInput.writeInput(staging);
+  }
+
+  filteredDynoTorque() { let s = 0; for (const v of this.dynoTorqueSamples) s += v; return s / ES_DYNO_TORQUE_SAMPLES; }
+  dynoPower() { return this.engine.speed() > 0 ? this.filteredDynoTorque() * this.engine.speed() : 0; }
+  totalExhaustFlow() { let s = 0; for (const ch of this.engine.chambers) s += ch.lastTimestepExhaustFlow; return s; }
 }
 
 /* -------------------------------------------------------------- Synthesizer */
 
 class ESButterworth {
-  constructor(cutoff, sampleRate) { this.x = [0, 0, 0, 0]; this.y = [0, 0, 0, 0]; this.a = [0, 0, 0, 0, 0]; this.f4 = 0; this.setCutoff(cutoff, sampleRate); }
+  constructor(cutoff, sampleRate) { this.x0 = this.x1 = this.x2 = this.x3 = 0; this.y0 = this.y1 = this.y2 = this.y3 = 0; this.setCutoff(cutoff, sampleRate); }
   setCutoff(fc, rate) {
-    const f = Math.tan(Math.PI * Math.min(fc, rate * 0.49) / rate), f2 = f * f, f3 = f2 * f, f4 = f2 * f2;
-    const m = -2 * Math.cos(5 * Math.PI / 8), n = -2 * Math.cos(7 * Math.PI / 8), a = this.a;
-    a[0] = 1 + (m + n) * f + (2 + n * m) * f2 + (m + n) * f3 + f4;
-    a[1] = (-4 - 2 * (n + m) * f + 2 * (m + n) * f3 + 4 * f4) / a[0];
-    a[2] = (6 - 2 * (2 + m * n) * f2 + 6 * f4) / a[0];
-    a[3] = (-4 + 2 * (m + n) * f - 2 * (m + n) * f3 + 4 * f4) / a[0];
-    a[4] = (1 - (n + m) * f + (2 + m * n) * f2 - (m + n) * f3 + f4) / a[0];
-    this.f4 = f4;
+    const f = Math.tan(Math.PI * fc / rate), f2 = f * f, f3 = f2 * f, f4 = f2 * f2;
+    const m = -2 * Math.cos(5 * Math.PI / 8), n = -2 * Math.cos(7 * Math.PI / 8);
+    const a0 = 1 + (m + n) * f + (2 + n * m) * f2 + (m + n) * f3 + f4;
+    this.a1 = (-4 - 2 * (n + m) * f + 2 * (m + n) * f3 + 4 * f4) / a0;
+    this.a2 = (6 - 2 * (2 + m * n) * f2 + 6 * f4) / a0;
+    this.a3 = (-4 + 2 * (m + n) * f - 2 * (m + n) * f3 + 4 * f4) / a0;
+    this.a4 = (1 - (n + m) * f + (2 + m * n) * f2 - (m + n) * f3 + f4) / a0;
+    this.g = f4 / a0;
   }
-  f(sample) {
-    const x = this.x, y = this.y, a = this.a;
-    const out = this.f4 / a[0] * (sample + 4 * x[3] + 6 * x[2] + 4 * x[1] + x[0])
-      - a[1] * y[3] - a[2] * y[2] - a[3] * y[1] - a[4] * y[0];
-    x[0] = x[1]; x[1] = x[2]; x[2] = x[3]; x[3] = sample;
-    y[0] = y[1]; y[1] = y[2]; y[2] = y[3]; y[3] = out;
-    return out;
+  // ButterworthLowPassFilter::fast_f; x3/y3 hold the newest previous values.
+  f(x) {
+    const y = this.g * (x + 4 * this.x3 + 6 * this.x2 + 4 * this.x1 + this.x0)
+      - this.a1 * this.y3 - this.a2 * this.y2 - this.a3 * this.y1 - this.a4 * this.y0;
+    this.x0 = this.x1; this.x1 = this.x2; this.x2 = this.x3; this.x3 = x;
+    this.y0 = this.y1; this.y1 = this.y2; this.y2 = this.y3; this.y3 = y;
+    return y;
   }
 }
 
+// JitterFilter (include/jitter_filter.h).
 class ESJitter {
   constructor(maxJitter, cutoff, rate) { this.history = new Float64Array(maxJitter); this.max = maxJitter; this.offset = 0; this.scale = 0; this.noise = new ESButterworth(cutoff, rate); }
   f(sample) {
     const h = this.history, max = this.max;
     h[this.offset] = sample; if (++this.offset >= max) this.offset = 0;
     const s = this.noise.f(Math.random() * (max - 1) * this.scale);
-    const i0 = esClamp(Math.floor(s), 0, max - 1), i1 = esClamp(Math.ceil(s), 0, max - 1), frac = s - i0;
-    const j0 = i0 + this.offset, j1 = i1 + this.offset;
+    const i0 = Math.min(Math.max(Math.floor(s), 0), max - 1), i1 = Math.min(Math.max(Math.ceil(s), 0), max - 1);
+    const frac = s - i0, j0 = i0 + this.offset, j1 = i1 + this.offset;
     return h[j1 >= max ? j1 - max : j1] * frac + h[j0 >= max ? j0 - max : j0] * (1 - frac);
   }
 }
 
-// Synthesizer (src/synthesizer.cpp) without the convolution stage, which runs in
-// a Web Audio ConvolverNode after this. Output is two channels in [-1, 1].
-class ESSynthesizer {
-  constructor(audioRate, inputRate, channels = 2) {
-    this.audioRate = audioRate; this.channels = channels;
-    this.params = { airNoise: 1, airNoiseCutoff: 2000, dFFMix: 0.01, jitter: 0.5, jitterCutoff: 10000, levelerTarget: 30000, levelerMax: 1.9, levelerMin: 0.00001 };
-    this.setInputRate(inputRate);
-    this.channelState = Array.from({ length: channels }, () => ({
-      last: 0, antialiasing: new ESButterworth(1900, audioRate), jitter: new ESJitter(10, 10000, audioRate),
-      dcY: 0, previous: 0,
-    }));
-    this.airNoise = new ESButterworth(2000, audioRate);
-    this.outputAntialiasing = [new ESButterworth(audioRate * 0.45, audioRate), new ESButterworth(audioRate * 0.45, audioRate)];
-    this.peak = 30000; this.attenuation = 1;
-    this.position = 0; // fractional audio-sample position of the last input
-    this.out = [[], []];
+// Radix-2 complex FFT on separate real and imaginary arrays.
+class ESFFT {
+  constructor(n) {
+    this.n = n; this.rev = new Uint32Array(n);
+    const bits = Math.log2(n);
+    for (let i = 0; i < n; i++) { let r = 0; for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b); this.rev[i] = r; }
+    this.cos = new Float64Array(n / 2); this.sin = new Float64Array(n / 2);
+    for (let i = 0; i < n / 2; i++) { this.cos[i] = Math.cos(2 * Math.PI * i / n); this.sin[i] = -Math.sin(2 * Math.PI * i / n); }
   }
-  setInputRate(rate) { this.inputRate = rate; this.ratio = this.audioRate / rate; }
-  setParameters(p) { Object.assign(this.params, p); this.airNoise.setCutoff(this.params.airNoiseCutoff, this.audioRate); }
-  writeInput(values) {
-    const next = this.position + this.ratio;
-    const first = Math.floor(this.position) + 1, last = Math.floor(next);
-    const resampled = this._scratch || (this._scratch = new Float64Array(this.channels));
-    for (let k = first; k <= last; k++) {
-      const f = (k - this.position) / this.ratio;
-      for (let c = 0; c < this.channels; c++) {
-        const st = this.channelState[c];
-        resampled[c] = st.antialiasing.f(st.last * (1 - f) + values[c] * f);
+  transform(re, im, inverse) {
+    const n = this.n, rev = this.rev;
+    for (let i = 0; i < n; i++) { const j = rev[i]; if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    const sgn = inverse ? -1 : 1;
+    for (let size = 2; size <= n; size <<= 1) {
+      const half = size >> 1, step = n / size;
+      for (let i = 0; i < n; i += size) {
+        for (let j = 0, k = 0; j < half; j++, k += step) {
+          const wr = this.cos[k], wi = sgn * this.sin[k];
+          const a = i + j, b = a + half;
+          const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+          re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        }
       }
-      this._render(resampled);
     }
-    for (let c = 0; c < this.channels; c++) this.channelState[c].last = values[c];
-    this.position = next - last;
   }
-  _render(input) {
-    const p = this.params, rate = this.audioRate, dt = 1 / rate;
-    const rcDc = 1 / (10 * ES_TAU), alphaDc = dt / (rcDc + dt);
-    const r = this.airNoise.f(2 * Math.random() - 1), rMixed = p.airNoise * r + (1 - p.airNoise);
-    let left = 0, right = 0;
-    for (let c = 0; c < this.channels; c++) {
-      const st = this.channelState[c];
-      st.jitter.scale = p.jitter;
-      const fIn = st.jitter.f(input[c]);
-      st.dcY = alphaDc * fIn + (1 - alphaDc) * st.dcY;
-      const f = fIn - st.dcY;
-      const fP = (fIn - st.previous) / dt; st.previous = fIn;
-      const v = fP * p.dFFMix + f * rMixed * (1 - p.dFFMix);
-      if (this.channels === 1 || this.mono) { left += v; right += v; }
-      else if (c % 2 === 0) { left += v; right += 0.35 * v; } else { right += v; left += 0.35 * v; }
-    }
-    left = this.outputAntialiasing[0].f(left); right = this.outputAntialiasing[1].f(right);
-    // LevelingFilter (src/leveling_filter.cpp), shared by both channels.
-    this.peak *= 0.999;
-    const peak = Math.max(Math.abs(left), Math.abs(right));
-    if (peak > this.peak) this.peak = peak;
-    if (this.peak > 0) {
-      const raw = esClamp(p.levelerTarget / this.peak, p.levelerMin, p.levelerMax);
-      this.attenuation = 0.9 * this.attenuation + 0.1 * raw;
-    }
-    this.out[0].push(esClamp(left * this.attenuation / 32768, -1, 1));
-    this.out[1].push(esClamp(right * this.attenuation / 32768, -1, 1));
-  }
-  drain() { const out = this.out; this.out = [[], []]; return out; }
 }
 
+// ConvolutionFilter (src/convolution_filter.cpp) computed block by block as a
+// uniformly partitioned overlap-save convolution. The output is identical to the
+// direct form; only the arithmetic is faster.
+class ESConvolution {
+  constructor(ir, block) {
+    this.B = block; this.N = 2 * block; this.fft = new ESFFT(this.N);
+    this.P = Math.max(1, Math.ceil(ir.length / block));
+    this.hRe = []; this.hIm = [];
+    for (let p = 0; p < this.P; p++) {
+      const re = new Float64Array(this.N), im = new Float64Array(this.N);
+      for (let i = 0; i < block; i++) { const k = p * block + i; re[i] = k < ir.length ? ir[k] : 0; }
+      this.fft.transform(re, im, false);
+      this.hRe.push(re); this.hIm.push(im);
+    }
+    this.xRe = Array.from({ length: this.P }, () => new Float64Array(this.N));
+    this.xIm = Array.from({ length: this.P }, () => new Float64Array(this.N));
+    this.head = 0; this.prev = new Float64Array(block);
+    this.accRe = new Float64Array(this.N); this.accIm = new Float64Array(this.N);
+  }
+  process(input, output) {
+    const B = this.B, N = this.N, P = this.P;
+    this.head = (this.head + P - 1) % P;
+    const re = this.xRe[this.head], im = this.xIm[this.head];
+    for (let i = 0; i < B; i++) { re[i] = this.prev[i]; re[B + i] = input[i]; im[i] = 0; im[B + i] = 0; this.prev[i] = input[i]; }
+    this.fft.transform(re, im, false);
+    const aRe = this.accRe, aIm = this.accIm;
+    aRe.fill(0); aIm.fill(0);
+    for (let p = 0; p < P; p++) {
+      const k = (this.head + p) % P, xr = this.xRe[k], xi = this.xIm[k], hr = this.hRe[p], hi = this.hIm[p];
+      for (let i = 0; i < N; i++) { aRe[i] += xr[i] * hr[i] - xi[i] * hi[i]; aIm[i] += xr[i] * hi[i] + xi[i] * hr[i]; }
+    }
+    this.fft.transform(aRe, aIm, true);
+    for (let i = 0; i < B; i++) output[i] = aRe[B + i] / N;
+  }
+}
+
+// Synthesizer::initializeImpulseResponse: clip after the last sample louder than
+// 100, keep at most 10000 samples and scale by the impulse response volume.
+function esImpulseResponse(samples, volume) {
+  let clipped = 0;
+  for (let i = 0; i < samples.length; i++) if (Math.abs(samples[i]) > 100) clipped = i + 1;
+  const n = Math.min(10000, clipped), out = new Float64Array(n);
+  for (let i = 0; i < n; i++) out[i] = volume * samples[i] / 32767;
+  return out;
+}
+
+// Synthesizer::writeInput: linear resampling of the simulation-rate exhaust
+// signal to the audio rate, followed by the per-channel antialiasing filter.
+class ESSynthesizerInput {
+  constructor(channels, audioRate = 44100) {
+    this.channels = channels; this.audioRate = audioRate; this.inputRate = 10000;
+    this.offset = 0; this.index = 0; this.last = new Float64Array(channels);
+    this.antialiasing = Array.from({ length: channels }, () => new ESButterworth(1900, audioRate));
+    this.out = Array.from({ length: channels }, () => []);
+  }
+  setInputSampleRate(rate) { this.inputRate = rate; }
+  writeInput(values) {
+    const last = this.offset, ratio = this.audioRate / this.inputRate, next = last + ratio;
+    for (; this.index <= next; this.index++) {
+      const f = (this.index - last) / ratio;
+      for (let c = 0; c < this.channels; c++) this.out[c].push(this.antialiasing[c].f(this.last[c] * (1 - f) + values[c] * f));
+    }
+    for (let c = 0; c < this.channels; c++) this.last[c] = values[c];
+    this.offset = next;
+    if (next > 1e6) { this.offset -= 1e6; this.index -= 1e6; }
+  }
+  drain() { const out = this.out.map(a => Float32Array.from(a)); this.out = Array.from({ length: this.channels }, () => []); return out; }
+}
+
+// Synthesizer::renderAudio, block by block. Takes per-channel input at the audio
+// rate and returns int16-scaled samples divided by 32768.
+class ESSynthesizerCore {
+  constructor(channels, impulseResponses, audioRate = 44100, block = 128) {
+    this.channels = channels; this.audioRate = audioRate; this.block = block;
+    this.params = { volume: 1, convolution: 1, dF_F_mix: 0.01, inputSampleNoise: 0.5, inputSampleNoiseFrequencyCutoff: 10000, airNoise: 1, airNoiseFrequencyCutoff: 2000, levelerTarget: 30000, levelerMaxGain: 1.9, levelerMinGain: 0.00001 };
+    const dt = 1 / audioRate, rc = 1 / (10 * 2 * Math.PI);
+    this.dcAlpha = dt / (rc + dt);
+    this.filters = Array.from({ length: channels }, (_, i) => ({
+      jitter: new ESJitter(10, 10000, audioRate), dc: 0, previous: 0,
+      convolution: new ESConvolution(impulseResponses[i] && impulseResponses[i].length ? impulseResponses[i] : new Float64Array([0]), block),
+    }));
+    this.airNoise = new ESButterworth(2000, audioRate);
+    this.antialiasing = new ESButterworth(audioRate * 0.45, audioRate);
+    this.peak = 30000; this.attenuation = 1;
+    this.vIn = new Float64Array(block); this.vConv = new Float64Array(block); this.sum = new Float64Array(block);
+  }
+  setParameters(p) { Object.assign(this.params, p); this.airNoise.setCutoff(this.params.airNoiseFrequencyCutoff, this.audioRate); }
+  // inputs: one Float32Array of `block` samples per channel; output: Float32Array.
+  render(inputs, output) {
+    const p = this.params, B = this.block, dt = 1 / this.audioRate, sum = this.sum;
+    const airNoise = p.airNoise, mix = p.dF_F_mix, conv = p.convolution;
+    sum.fill(0);
+    // The original draws the air noise from the filter of channel 0 for every
+    // channel, so that filter advances once per channel per sample.
+    const noise = this.noise || (this.noise = Array.from({ length: this.channels }, () => new Float64Array(B)));
+    for (let i = 0; i < B; i++) for (let c = 0; c < this.channels; c++) noise[c][i] = this.airNoise.f(2 * Math.random() - 1);
+    for (let c = 0; c < this.channels; c++) {
+      const flt = this.filters[c], input = inputs[c], vIn = this.vIn;
+      flt.jitter.scale = p.inputSampleNoise;
+      for (let i = 0; i < B; i++) {
+        const fIn = flt.jitter.f(input[i]);
+        flt.dc = this.dcAlpha * fIn + (1 - this.dcAlpha) * flt.dc;
+        const f = fIn - flt.dc;
+        const fP = (fIn - flt.previous) / dt; flt.previous = fIn;
+        const r = noise[c][i];
+        const rMixed = airNoise * r + (1 - airNoise);
+        vIn[i] = fP * mix + f * rMixed * (1 - mix);
+      }
+      flt.convolution.process(vIn, this.vConv);
+      for (let i = 0; i < B; i++) sum[i] += conv * this.vConv[i] + (1 - conv) * vIn[i];
+    }
+    for (let i = 0; i < B; i++) {
+      const signal = this.antialiasing.f(sum[i]);
+      // LevelingFilter (src/leveling_filter.cpp)
+      this.peak *= 0.999;
+      if (Math.abs(signal) > this.peak) this.peak = Math.abs(signal);
+      let leveled = 0;
+      if (this.peak !== 0) {
+        const raw = Math.min(Math.max(p.levelerTarget / this.peak, p.levelerMinGain), p.levelerMaxGain);
+        this.attenuation = 0.9 * this.attenuation + 0.1 * raw;
+        leveled = signal * this.attenuation;
+      }
+      let v = Math.round(leveled * p.volume);
+      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+      output[i] = v / 32768;
+    }
+  }
+}
 /* ------------------------------------------------------------------ Engines */
 
-const esDisk = (mass, radius) => 0.5 * mass * radius * radius;
+// Engine descriptions transcribed from the engine-sim scripts in assets/engines.
+// Lengths in m, angles in rad, masses in kg, flow rates in scfm (k_carb and
+// k_28inH2O are applied when the engine is built), port flow tables in CFM at
+// 28 inH2O per 50 thou of lift.
 const U = ES_UNITS;
-const ES_ENGINES = {
-  // Honda B18C5 (assets/engines/atg-video-1/05_honda_vtec.mr) on its low-speed cam, without VTEC switching.
-  i4: {
-    name: 'Honda B18 · Inline 4', cylinders: 4, banks: 1, bankAngle: 0,
-    bore: 81 * U.mm, stroke: 87.2 * U.mm, rod: 5.43 * U.inch,
-    pistonMass: 303.5 * U.g, rodMass: 395.837 * U.g,
-    crankInertia: 0.22986844776863666 * 0.5, crankFriction: 1 * U.lbft,
-    starterTorque: 70 * U.lbft, starterSpeed: 500, redline: 8000, revLimit: 8400, limiterDuration: 0.05,
-    firingOrder: [1, 3, 4, 2], compressionRatio: 11.8,
-    cam: { duration: 210, lift: 7 * U.mm, gamma: 1.0, intakeCenter: 116, exhaustCenter: 116 },
+const esDisk = (mass, radius) => 0.5 * mass * radius * radius;
+const esRodMoment = (mass, length) => mass * length * length / 12;
+const esCircleArea = r => Math.PI * r * r;
+const ES_CYCLE = 4 * Math.PI;
+
+function esTurbulence(scale) { return [0, 5, 10, 15, 20, 25, 30, 35, 40, 45].map((x, i) => i === 0 ? 3 : scale(x) * x); }
+
+const ES_ENGINES = {};
+
+// assets/engines/atg-video-2/01_subaru_ej25_eh.mr (the default engine in assets/main.mr).
+ES_ENGINES.subaru_ej25 = (() => {
+  const stroke = 79 * U.mm, bore = 99.5 * U.mm, rod = 5.142 * U.inch, rodMass = 535 * U.g, ch = 1 * U.inch;
+  const crankMass = 9.39, flywheelMass = 6.8, flywheelRadius = 6 * U.inch;
+  const ilc = 117 * U.deg, elc = 112 * U.deg, r360 = 2 * Math.PI;
+  const intakeLobe = { duration: 232 * U.deg, gamma: 2, lift: 9.78 * U.mm, steps: 100 };
+  const exhaustLobe = { duration: 236 * U.deg, gamma: 2, lift: 9.60 * U.mm, steps: 100 };
+  const cam = (lobe, base, ks) => ({ lobe, baseRadius: 17 * U.mm, lobes: ks.map(k => base + k / 4 * ES_CYCLE) });
+  return {
+    name: 'Subaru EJ25', starterTorque: 70 * U.lbft, starterSpeed: 500 * U.rpm, redline: 6500 * U.rpm,
+    throttleGamma: 2, hfGain: 0.01, noise: 1.0, jitter: 0.5, simulationFrequency: 20000,
+    fuel: { maxBurningEfficiency: 0.9, turbulenceToFlameSpeedRatio: esTurbulence(x => x < 15 ? 1.5 : x < 20 ? 1.1 * 1.5 : 1.25 * 1.5) },
+    crankshaft: {
+      throw: stroke / 2, mass: crankMass, flywheelMass, frictionTorque: 1 * U.lbft, tdc: 180 * U.deg,
+      momentOfInertia: esDisk(crankMass, stroke / 2) + 2 * esDisk(flywheelMass, flywheelRadius) + esDisk(10, 6 * U.cm),
+      journals: [0, 180 * U.deg, 0, 180 * U.deg],
+    },
+    piston: { mass: (414 + 152) * U.g, compressionHeight: ch, displacement: 0 },
+    rod: { mass: rodMass, momentOfInertia: esRodMoment(rodMass, rod), length: rod },
+    bore, deckHeight: stroke / 2 + rod + ch,
     head: {
-      intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (1.35 * U.inch) ** 2,
+      chamberVolume: 67 * U.cc, intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (1.75 * U.inch) ** 2,
+      exhaustRunnerVolume: 50 * U.cc, exhaustRunnerArea: (1.25 * U.inch) ** 2,
+      intakeFlow: [0, 58, 103, 156, 214, 249, 268, 280, 280, 281], exhaustFlow: [0, 37, 72, 113, 160, 196, 222, 235, 245, 246],
+    },
+    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 400, runnerFlowRate: 100, runnerLength: 12 * U.inch, idleFlowRate: 0, idlePlate: 0.9978, velocityDecay: 1.0 },
+    exhausts: [{ length: 500 * U.mm, collectorArea: esCircleArea(2 * U.inch), outletFlowRate: 1000, primaryTubeLength: 40 * U.inch, primaryFlowRate: 400, audioVolume: 0.5 * 0.02, velocityDecay: 1.0, impulseResponse: 'minimal_muffling_02' }],
+    banks: [
+      {
+        angle: 90 * U.deg, flip: true,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + ilc, [0, 1]), exhaustCam: cam(exhaustLobe, r360 - elc, [0, 1]) },
+        cylinders: [
+          { journal: 0, wire: 0, primaryLength: 2 * U.inch, soundAttenuation: 0.9, blowby: 0.001 },
+          { journal: 3, wire: 2, primaryLength: 3 * U.inch, soundAttenuation: 1.0, blowby: 0.002 },
+        ],
+      },
+      {
+        angle: -90 * U.deg, flip: false,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + ilc, [2, 3]), exhaustCam: cam(exhaustLobe, r360 - elc, [2, 3]) },
+        cylinders: [
+          { journal: 1, wire: 1, primaryLength: 3 * U.inch, soundAttenuation: 1.1, blowby: 0.001 },
+          { journal: 2, wire: 3, primaryLength: 5 * U.inch, soundAttenuation: 0.9, blowby: 0.002 },
+        ],
+      },
+    ],
+    // Wire angles by wire number - 1.
+    ignition: {
+      timing: [[0, 25], [1000, 25], [2000, 30], [3000, 40], [4000, 40]].map(([r, a]) => [r * U.rpm, a * U.deg]),
+      revLimit: 6800 * U.rpm, limiterDuration: 0.16,
+      wires: [0, 2 / 4 * ES_CYCLE, 1 / 4 * ES_CYCLE, 3 / 4 * ES_CYCLE],
+    },
+    vehicle: { mass: 2700 * U.lb, dragCoefficient: 0.3, crossSectionArea: (72 * U.inch) * (56 * U.inch), diffRatio: 3.9, tireRadius: 10 * U.inch, rollingResistance: 0.015 * 2700 * U.lb * 9.81 },
+    transmission: { maxClutchTorque: 300 * U.lbft, gears: [3.636, 2.375, 1.761, 1.346, 0.971, 0.756] },
+  };
+})();
+
+// assets/engines/atg-video-1/05_honda_vtec.mr. This engine turns the other way
+// (negative starter speed), with negative timing values to match.
+ES_ENGINES.honda_b18c5 = (() => {
+  const stroke = 87.2 * U.mm, bore = 81 * U.mm, rod = 5.43 * U.inch, ch = 1 * U.inch;
+  const r360 = 2 * Math.PI, order = [0, 3, 1, 2];
+  const lobe = (duration, gamma, lift) => ({ duration: duration * U.deg, gamma, lift: lift * U.mm, steps: 100 });
+  const cam = (l, base) => ({ lobe: l, baseRadius: 500 * U.thou, lobes: order.map(k => base - k / 4 * ES_CYCLE) });
+  const es = { collectorArea: esCircleArea(2 * U.inch), outletFlowRate: 1000, primaryTubeLength: 10 * U.inch, primaryFlowRate: 200, velocityDecay: 1.0, impulseResponse: 'mild_exhaust_0' };
+  es.length = 100 * U.L / es.collectorArea;
+  return {
+    name: 'Honda B18C5 [VTEC, I4]', starterTorque: 70 * U.lbft, starterSpeed: -500 * U.rpm, redline: 8400 * U.rpm,
+    throttleGamma: 2, hfGain: 0.002, noise: 0.253, jitter: 0.195, simulationFrequency: 20000,
+    fuel: { maxTurbulenceEffect: 2.5, maxBurningEfficiency: 0.75 },
+    crankshaft: {
+      throw: stroke / 2, mass: 35.5 * U.lb, flywheelMass: 10 * U.lb, frictionTorque: 1 * U.lbft, tdc: 90 * U.deg,
+      momentOfInertia: 0.22986844776863666 * 0.5, journals: [0, 180 * U.deg, 180 * U.deg, 0],
+    },
+    piston: { mass: 303.5 * U.g, compressionHeight: ch, displacement: 0 },
+    rod: { mass: 395.837 * U.g, momentOfInertia: 0.0015884918028487504, length: rod },
+    bore, deckHeight: stroke / 2 + rod + ch,
+    head: {
+      chamberVolume: 41.6 * U.cc, intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (1.35 * U.inch) ** 2,
       exhaustRunnerVolume: 50 * U.cc, exhaustRunnerArea: (1.25 * U.inch) ** 2,
       intakeFlow: [0, 50, 80, 125, 160, 190, 210, 225, 230, 250], exhaustFlow: [0, 50, 80, 110, 130, 150, 160, 170, 170, 170],
     },
-    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 800, runnerFlowRate: 250, runnerLength: 7 * U.inch, idleFlowRate: 0, idlePlate: 0.9989, velocityDecay: 0.5, throttleGamma: 2 },
-    exhaust: { outletFlowRate: 1000, primaryTubeLength: 10 * U.inch, primaryFlowRate: 200, velocityDecay: 1, collectorArea: Math.PI * (2 * U.inch) ** 2, lengths: [100 * U.L / (Math.PI * (2 * U.inch) ** 2), 100 * U.L / (Math.PI * (2 * U.inch) ** 2)], audioVolume: [6, 8] },
-    blowby: [0.001, 0.002, 0.001, 0.002], soundAttenuation: [0.9, 1.1, 0.8, 0.9],
-    fuel: { maxTurbulenceEffect: 2.5, maxBurningEfficiency: 0.75 },
-    timing: [[0, 25], [1000, 25], [2000, 30], [3000, 40], [4000, 40]],
-    vehicle: { mass: 2400 * U.lb, dragCoefficient: 0.2, area: 66 * 50 * U.inch * U.inch, diffRatio: 3.55, tireRadius: 10 * U.inch, rollingResistance: 300 },
-    transmission: { gears: [3.23, 2.105, 1.458, 1.107, 0.848], maxClutchTorque: 300 * U.lbft },
-    simulationFrequency: 20000, audio: { dFFMix: 0.002, airNoise: 0.253, jitter: 0.195 },
-  },
-  // Generic 60 degree V6 (assets/engines/atg-video-2/04_60_degree_v6.mr).
-  v6: {
-    name: 'V6 60°', cylinders: 6, banks: 2, bankAngle: 60,
-    bore: 3.5 * U.inch, stroke: 3.48 * U.inch, rod: 5.142 * U.inch,
-    pistonMass: (414 + 152) * U.g, rodMass: 535 * U.g,
-    crankInertia: esDisk(50 * U.lb, 3.48 * U.inch) + esDisk(30 * U.lb, 7 * U.inch) + esDisk(10, 0.01), crankFriction: 20 * U.lbft,
-    starterTorque: 70 * U.lbft, starterSpeed: 500, redline: 5500, revLimit: 5600, limiterDuration: 0.2,
-    firingOrder: [1, 2, 3, 4, 5, 6], compressionRatio: 9.2,
-    cam: { duration: 222, lift: 400 * U.thou, gamma: 1.0, intakeCenter: 117, exhaustCenter: 112 },
+    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 800, runnerFlowRate: 250, runnerLength: 7 * U.inch, idleFlowRate: 0, idlePlate: 0.9989, velocityDecay: 0.5 },
+    exhausts: [Object.assign({}, es, { audioVolume: 8 * 0.75 }), Object.assign({}, es, { audioVolume: 8 * 1.0 })],
+    banks: [{
+      angle: 0, flip: false,
+      valvetrain: {
+        intakeCam: cam(lobe(210, 1, 6.9), r360 - 116 * U.deg),
+        exhaustCam: cam(lobe(190, 1, 6.5), r360 + 116 * U.deg),
+        vtec: {
+          intakeCam: cam(lobe(240, 0.5, 11.5), r360 - 100 * U.deg),
+          exhaustCam: cam(lobe(232, 0.5, 10.5), r360 + 100 * U.deg),
+          minRpm: 5800 * U.rpm, minSpeed: 10 * U.mph, manifoldVacuum: ES_ATM - 5 * U.inHg, minThrottlePosition: 0.3,
+        },
+      },
+      cylinders: [
+        { journal: 0, wire: 0, exhaust: 0, soundAttenuation: 0.9, blowby: 0.001 },
+        { journal: 1, wire: 1, exhaust: 1, soundAttenuation: 1.1, blowby: 0.002 },
+        { journal: 2, wire: 2, exhaust: 0, soundAttenuation: 0.8, blowby: 0.001 },
+        { journal: 3, wire: 3, exhaust: 1, soundAttenuation: 0.9, blowby: 0.002 },
+      ],
+    }],
+    ignition: {
+      timing: [[0, -25], [1000, -25], [2000, -30], [3000, -40], [4000, -40]].map(([r, a]) => [r * U.rpm, a * U.deg]),
+      revLimit: 9400 * U.rpm, limiterDuration: 0.05,
+      wires: [0, 1 / 4 * ES_CYCLE, 3 / 4 * ES_CYCLE, 2 / 4 * ES_CYCLE],
+    },
+    vehicle: { mass: 2400 * U.lb, dragCoefficient: 0.2, crossSectionArea: (66 * U.inch) * (50 * U.inch), diffRatio: 3.55, tireRadius: 10 * U.inch, rollingResistance: 300 },
+    transmission: { maxClutchTorque: 300 * U.lbft, gears: [3.23, 2.105, 1.458, 1.107, 0.848] },
+  };
+})();
+
+// assets/engines/atg-video-2/04_60_degree_v6.mr
+ES_ENGINES.v6_60 = (() => {
+  const stroke = 3.48 * U.inch, bore = 3.5 * U.inch, rod = 5.142 * U.inch, rodMass = 535 * U.g, ch = 1 * U.inch;
+  const r360 = 2 * Math.PI, ilc = 117 * U.deg, elc = 112 * U.deg, spacing = 5 * U.inch;
+  const intakeLobe = { duration: 222 * U.deg, gamma: 1, lift: 400 * U.thou, steps: 100 };
+  const exhaustLobe = { duration: 226 * U.deg, gamma: 1, lift: 300 * U.thou, steps: 100 };
+  const cam = (lobe, base, offsets) => ({ lobe, baseRadius: 0.75 * U.inch, lobes: offsets.map(o => base + o * U.deg) });
+  const es = { length: 100 * U.inch, collectorArea: esCircleArea(2 * U.inch), outletFlowRate: 1000, primaryTubeLength: 20 * U.inch, primaryFlowRate: 500, velocityDecay: 1.0, audioVolume: 1.0, impulseResponse: 'mild_exhaust_0_reverb' };
+  return {
+    name: 'Generic 60 deg. V6', starterTorque: 70 * U.lbft, starterSpeed: 500 * U.rpm, redline: 5500 * U.rpm, throttleGamma: 2,
+    crankshaft: {
+      throw: stroke / 2, mass: 50 * U.lb, flywheelMass: 30 * U.lb, frictionTorque: 20 * U.lbft, tdc: 120 * U.deg,
+      momentOfInertia: esDisk(50 * U.lb, stroke) + esDisk(30 * U.lb, 7 * U.inch) + esDisk(10, 1 * U.cm),
+      journals: [0, 60, 240, 300, 120, 180].map(a => a * U.deg),
+    },
+    piston: { mass: (414 + 152) * U.g, compressionHeight: ch, displacement: 0 },
+    rod: { mass: rodMass, momentOfInertia: esRodMoment(rodMass, rod), length: rod },
+    bore, deckHeight: stroke / 2 + rod + ch,
     head: {
-      intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (1.35 * U.inch) ** 2,
+      chamberVolume: 67 * U.cc, intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (1.35 * U.inch) ** 2,
       exhaustRunnerVolume: 50 * U.cc, exhaustRunnerArea: (2 * U.inch) ** 2,
       intakeFlow: [0, 58, 103, 156, 214, 249, 268, 280, 280, 281], exhaustFlow: [0, 37, 72, 113, 160, 196, 222, 235, 245, 246],
     },
-    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 400, runnerFlowRate: 250, runnerLength: 4 * U.inch, idleFlowRate: 0, idlePlate: 0.994, velocityDecay: 0.5, throttleGamma: 2 },
-    exhaust: { outletFlowRate: 1000, primaryTubeLength: 20 * U.inch, primaryFlowRate: 500, velocityDecay: 1, collectorArea: Math.PI * (2 * U.inch) ** 2, lengths: [100 * U.inch, 100 * U.inch], audioVolume: [1, 1] },
-    blowby: [0.1, 0.1, 0.2, 0.2, 0.2, 0.2], soundAttenuation: [0.9, 0.95, 0.95, 0.9, 1, 1],
-    primaryLengths: [10 * U.inch, 10 * U.inch, 5 * U.inch, 5 * U.inch, 0, 0],
-    fuel: {},
-    timing: [[0, 12], [1000, 20], [2000, 25], [3000, 30], [4000, 30]],
-    vehicle: { mass: 2700 * U.lb, dragCoefficient: 0.3, area: 72 * 56 * U.inch * U.inch, diffRatio: 3.9, tireRadius: 10 * U.inch, rollingResistance: 0.015 * 2700 * U.lb * 9.81 },
-    transmission: { gears: [3.636, 2.375, 1.761, 1.346, 0.971, 0.756], maxClutchTorque: 300 * U.lbft },
-    simulationFrequency: 10000, audio: { dFFMix: 0.01, airNoise: 1, jitter: 0.5 },
-  },
-  // GM LS (assets/engines/atg-video-2/07_gm_ls.mr).
-  v8: {
-    name: 'GM LS V8', cylinders: 8, banks: 2, bankAngle: 90,
-    bore: 3.78 * U.inch, stroke: 3.622 * U.inch, rod: 160 * U.mm,
-    pistonMass: 100 * U.g, rodMass: 50 * U.g,
-    crankInertia: 1.5 * esDisk(60 * U.lb, 3.622 * U.inch) + esDisk(30 * U.lb, 8 * U.inch) + esDisk(1, 0.01), crankFriction: 20 * U.lbft,
-    starterTorque: 200 * U.lbft, starterSpeed: 200, redline: 6500, revLimit: 6800, limiterDuration: 0.2,
-    firingOrder: [1, 8, 7, 2, 6, 5, 4, 3], compressionRatio: 8.4,
-    cam: { duration: 234, lift: 551 * U.thou, gamma: 1.1, intakeCenter: 116, exhaustCenter: 116 },
+    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 400, runnerFlowRate: 250, runnerLength: 4 * U.inch, idleFlowRate: 0, idlePlate: 0.994, velocityDecay: 0.5 },
+    exhausts: [Object.assign({}, es), Object.assign({}, es)],
+    banks: [
+      {
+        angle: 30 * U.deg, flip: true,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + ilc, [0, 240, 480]), exhaustCam: cam(exhaustLobe, r360 - elc, [0, 240, 480]) },
+        cylinders: [
+          { journal: 0, wire: 0, exhaust: 0, soundAttenuation: 0.9, primaryLength: 2 * spacing, blowby: 0.1 },
+          { journal: 2, wire: 2, exhaust: 0, soundAttenuation: 0.95, primaryLength: spacing, blowby: 0.2 },
+          { journal: 4, wire: 4, exhaust: 0, soundAttenuation: 1.0, primaryLength: 0, blowby: 0.2 },
+        ],
+      },
+      {
+        angle: -30 * U.deg, flip: false,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + ilc, [120, 360, 600]), exhaustCam: cam(exhaustLobe, r360 - elc, [120, 360, 600]) },
+        cylinders: [
+          { journal: 1, wire: 1, exhaust: 1, soundAttenuation: 0.95, primaryLength: 2 * spacing, blowby: 0.1 },
+          { journal: 3, wire: 3, exhaust: 1, soundAttenuation: 0.9, primaryLength: spacing, blowby: 0.2 },
+          { journal: 5, wire: 5, exhaust: 1, soundAttenuation: 1.0, primaryLength: 0, blowby: 0.2 },
+        ],
+      },
+    ],
+    ignition: {
+      timing: [[0, 12], [1000, 20], [2000, 25], [3000, 30], [4000, 30]].map(([r, a]) => [r * U.rpm, a * U.deg]),
+      revLimit: 5600 * U.rpm, limiterDuration: 0.2,
+      wires: [0, 120, 240, 360, 480, 600].map(a => a * U.deg),
+    },
+    vehicle: { mass: 2700 * U.lb, dragCoefficient: 0.3, crossSectionArea: (72 * U.inch) * (56 * U.inch), diffRatio: 3.9, tireRadius: 10 * U.inch, rollingResistance: 0.015 * 2700 * U.lb * 9.81 },
+    transmission: { maxClutchTorque: 300 * U.lbft, gears: [3.636, 2.375, 1.761, 1.346, 0.971, 0.756] },
+  };
+})();
+
+// assets/engines/atg-video-2/07_gm_ls.mr
+ES_ENGINES.gm_ls = (() => {
+  const stroke = 3.622 * U.inch, bore = 3.78 * U.inch, rod = 160 * U.mm, rodMass = 50 * U.g, ch = 1 * U.inch;
+  const r360 = 2 * Math.PI, rot = 90 * U.deg, lc = 116 * U.deg, vAngle = 90 * U.deg, spacing = 2 * U.inch;
+  const intakeLobe = { duration: 234 * U.deg, gamma: 1.1, lift: 551 * U.thou, steps: 256 };
+  const exhaustLobe = { duration: 235 * U.deg, gamma: 1.1, lift: 551 * U.thou, steps: 256 };
+  const cam = (lobe, base, ks) => ({ lobe, baseRadius: 1 * U.inch, lobes: ks.map(k => base + k * rot) });
+  const es = { collectorArea: esCircleArea(2 * U.inch), outletFlowRate: 1000, primaryTubeLength: 29 * U.inch, primaryFlowRate: 500, velocityDecay: 1.0, audioVolume: 4.0, impulseResponse: 'default_0' };
+  const cyl = (journal, wire, exhaust, primaryLength) => ({ journal, wire: wire - 1, exhaust, soundAttenuation: 1, primaryLength, blowby: 0 });
+  return {
+    name: 'GM LS', starterTorque: 200 * U.lbft, starterSpeed: 200 * U.rpm, redline: 6500 * U.rpm, throttleGamma: 2,
+    hfGain: 0.01, noise: 1.0, jitter: 0.6, simulationFrequency: 10000,
+    fuel: { maxBurningEfficiency: 1.0, turbulenceToFlameSpeedRatio: esTurbulence(x => x < 10 ? 1.5 : x < 15 ? 1.75 : 2.0) },
+    crankshaft: {
+      throw: stroke / 2, mass: 60 * U.lb, flywheelMass: 30 * U.lb, frictionTorque: 20 * U.lbft, tdc: 90 * U.deg - vAngle / 2,
+      momentOfInertia: 1.5 * esDisk(60 * U.lb, stroke) + esDisk(30 * U.lb, 8 * U.inch) + esDisk(1, 1 * U.cm),
+      journals: [0, 270, 90, 180].map(a => a * U.deg),
+    },
+    piston: { mass: 100 * U.g, compressionHeight: ch, displacement: 0 },
+    rod: { mass: rodMass, momentOfInertia: esRodMoment(rodMass, rod), length: rod },
+    bore, deckHeight: stroke / 2 + rod + ch,
     head: {
-      intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (2.2 * U.inch) ** 2,
+      chamberVolume: 90 * U.cc, intakeRunnerVolume: 149.6 * U.cc, intakeRunnerArea: (2.2 * U.inch) ** 2,
       exhaustRunnerVolume: 50 * U.cc, exhaustRunnerArea: (1.75 * U.inch) ** 2,
       intakeFlow: [0, 1, 103, 156, 214, 249, 268, 280, 280, 281], exhaustFlow: [0, 1, 72, 113, 160, 196, 222, 235, 245, 246],
     },
-    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 700, runnerFlowRate: 100, runnerLength: 12 * U.inch, idleFlowRate: 0, idlePlate: 0.996, velocityDecay: 0.5, throttleGamma: 2 },
-    exhaust: { outletFlowRate: 1000, primaryTubeLength: 29 * U.inch, primaryFlowRate: 500, velocityDecay: 1, collectorArea: Math.PI * (2 * U.inch) ** 2, lengths: [100 * U.inch, 172 * U.inch], audioVolume: [4, 4] },
-    blowby: [], soundAttenuation: [],
-    primaryLengths: [6 * U.inch + 2 * U.cm, 6 * U.inch + 1 * U.cm, 4 * U.inch + 1 * U.cm, 4 * U.inch + 5 * U.cm, 2 * U.inch + 3 * U.cm, 2 * U.inch + 7 * U.cm, 5 * U.cm, 0],
-    fuel: { maxBurningEfficiency: 1.0, turbulenceToFlameSpeedRatio: [3, 7.5, 17.5, 30, 40, 50, 60, 70, 80, 90] },
-    timing: [[0, 12], [1000, 12], [2000, 20], [3000, 30], [4000, 40], [8000, 40]],
-    vehicle: { mass: 1614, dragCoefficient: 0.3, area: 72 * 50 * U.inch * U.inch, diffRatio: 3.42, tireRadius: 10 * U.inch, rollingResistance: 200 },
-    transmission: { gears: [2.97, 2.07, 1.43, 1.0, 0.71, 0.57], maxClutchTorque: 500 * U.lbft },
-    simulationFrequency: 10000, audio: { dFFMix: 0.01, airNoise: 1, jitter: 0.6 },
-  },
-};
+    intake: { plenumVolume: 1.325 * U.L, plenumArea: 20 * U.cm2, flowRate: 700, runnerFlowRate: 100, runnerLength: 12 * U.inch, idleFlowRate: 0, idlePlate: 0.996, velocityDecay: 0.5 },
+    exhausts: [Object.assign({}, es, { length: 100 * U.inch }), Object.assign({}, es, { length: 172 * U.inch })],
+    banks: [
+      {
+        angle: -vAngle / 2, flip: false,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + lc, [0, 7, 5, 2]), exhaustCam: cam(exhaustLobe, r360 - lc, [0, 7, 5, 2]) },
+        cylinders: [cyl(0, 1, 0, 3 * spacing + 2 * U.cm), cyl(1, 3, 0, 2 * spacing + 1 * U.cm), cyl(2, 5, 0, spacing + 3 * U.cm), cyl(3, 7, 0, 5 * U.cm)],
+      },
+      {
+        angle: vAngle / 2, flip: true,
+        valvetrain: { intakeCam: cam(intakeLobe, r360 + lc, [3, 6, 4, 1]), exhaustCam: cam(exhaustLobe, r360 - lc, [3, 6, 4, 1]) },
+        cylinders: [cyl(0, 2, 1, 3 * spacing + 1 * U.cm), cyl(1, 4, 1, 2 * spacing + 5 * U.cm), cyl(2, 6, 1, spacing + 7 * U.cm), cyl(3, 8, 1, 0)],
+      },
+    ],
+    ignition: {
+      timing: [[0, 12], [1000, 12], [2000, 20], [3000, 30], [4000, 40], [5000, 40], [6000, 40], [7000, 40], [8000, 40]].map(([r, a]) => [r * U.rpm, a * U.deg]),
+      revLimit: 6800 * U.rpm, limiterDuration: 0.2,
+      // wire1..wire8 connected at 0, 3, 7, 6, 5, 4, 2, 1 times 90 degrees.
+      wires: [0, 3, 7, 6, 5, 4, 2, 1].map(k => k * 90 * U.deg),
+    },
+    vehicle: { mass: 1614, dragCoefficient: 0.3, crossSectionArea: (72 * U.inch) * (50 * U.inch), diffRatio: 3.42, tireRadius: 10 * U.inch, rollingResistance: 200 },
+    transmission: { maxClutchTorque: 500 * U.lbft, gears: [2.97, 2.07, 1.43, 1.0, 0.71, 0.57] },
+  };
+})();
 
-/* ---------------------------------------------------------------- Simulator */
-
-const ES_TORQUE_BINS = 512;
-
-class ESEngineSimulation {
-  constructor(spec, options = {}) {
-    this.spec = spec;
-    this.theta = 0; this.omega = 0;
-    this.controls = {
-      throttle: 0, ignition: false, starter: false, load: 0, brake: 0, gear: 0, clutch: 1,
-      dyno: { enabled: false, hold: false, rpm: 0 },
-    };
-    this.vehicleSpeed = 0;
-    this.revLimitTimer = 0;
-    this.sparks = new Float64Array(spec.cylinders);
-    this.ignitionEvents = 0;
-    this.time = 0;
-    this.torqueBins = new Float64Array(ES_TORQUE_BINS); this.dynoBins = new Float64Array(ES_TORQUE_BINS); this.lastBin = 0;
-    this.trace = { pressure: new Float64Array(720), volume: new Float64Array(720), intake: new Float64Array(720), exhaust: new Float64Array(720), moles: new Float64Array(720), temperature: new Float64Array(720), intakeLift: new Float64Array(720), exhaustLift: new Float64Array(720) };
-    this.configure(Object.assign({
-      firingOrder: spec.firingOrder, compressionRatio: spec.compressionRatio,
-      duration: spec.cam.duration, lift: spec.cam.lift, exhaustMode: 'split', afr: 14.7, timingOffset: 0,
-      simulationFrequency: spec.simulationFrequency,
-    }, options));
-  }
-
-  configure(options) {
-    this.options = Object.assign({}, this.options, options);
-    const spec = this.spec, o = this.options, n = spec.cylinders;
-    this.timestep = 1 / o.simulationFrequency;
-    this.crankRadius = spec.stroke / 2;
-    this.boreArea = Math.PI * spec.bore * spec.bore / 4;
-    this.sweptVolume = this.boreArea * spec.stroke;
-    this.clearanceVolume = this.sweptVolume / (o.compressionRatio - 1);
-    this.recipMass = spec.pistonMass + spec.rodMass / 2;
-    this.inertia = spec.crankInertia + n * (spec.rodMass / 2) * this.crankRadius * this.crankRadius;
-    // Cylinder i reaches firing TDC at cycle angle delta[i].
-    this.delta = new Float64Array(n);
-    o.firingOrder.forEach((cylinder, k) => { this.delta[cylinder - 1] = k * ES_FOUR_PI / n; });
-    const lobe = esHarmonicLobeTable(o.duration, o.lift, spec.cam.gamma);
-    this.intakeLobe = lobe; this.exhaustLobe = lobe;
-    this.intakeCenter = ES_TAU + spec.cam.intakeCenter * U.deg;
-    this.exhaustCenter = ES_TAU - spec.cam.exhaustCenter * U.deg;
-    const lifts = spec.head.intakeFlow.map((_, i) => i * 50 * U.thou);
-    this.intakePortFlow = new ESTable(lifts, spec.head.intakeFlow.map(esK28));
-    this.exhaustPortFlow = new ESTable(lifts, spec.head.exhaustFlow.map(esK28));
-    this.timingCurve = new ESTable(spec.timing.map(p => p[0]), spec.timing.map(p => p[1]));
-    this.turbulence = new ESTable(Array.from({ length: 30 }, (_, i) => i), Array.from({ length: 30 }, (_, i) => i * 0.5));
-    this.fuel = new ESFuel(spec.fuel);
-    this.intake = new ESIntake(spec.intake);
-    this.intake.afrScale = o.afr / 14.7;
-    this.exhausts = spec.exhaust.lengths.map((length, i) => new ESExhaustSystem(spec.exhaust, length, spec.exhaust.audioVolume[i]));
-    this.chambers = Array.from({ length: n }, (_, i) => new ESChamber(this, i));
-    this.chambers.forEach(ch => ch.initialize());
-    this.delays = this.chambers.map(ch => {
-      const length = ch.headerLength + ch.exhaust.length;
-      return { buffer: new Float64Array(Math.max(1, Math.round(length / 343 * o.simulationFrequency)) + 1), index: 0, length };
-    });
-    this.lastCycleAngle = this.cycleAngle();
-  }
-
-  exhaustFor(i) { return this.options.exhaustMode === 'single' ? this.exhausts[0] : this.exhausts[(i + 1) % 2 === 1 ? 0 : 1]; }
-  cycleAngle() { return esMod(this.theta, ES_FOUR_PI); }
-  localAngle(i) { return esMod(this.theta - this.delta[i], ES_FOUR_PI); }
-  // Piston pin distance from crank centre along the bore axis (PistonEngineSimulator::placeCylinder).
-  pistonPosition(a) {
-    const r = this.crankRadius, L = this.spec.rod, s = Math.sin(a);
-    return r * Math.cos(a) + Math.sqrt(L * L - r * r * s * s);
-  }
-  chamberVolumeAt(i) {
-    const s = this.pistonPosition(this.localAngle(i));
-    return this.boreArea * (this.crankRadius + this.spec.rod - s) + this.clearanceVolume;
-  }
-  intakeLift(i) { return this.intakeLobe.sample(esMod((this.localAngle(i) - this.intakeCenter) / 2 + Math.PI, ES_TAU) - Math.PI); }
-  exhaustLift(i) { return this.exhaustLobe.sample(esMod((this.localAngle(i) - this.exhaustCenter) / 2 + Math.PI, ES_TAU) - Math.PI); }
-  rpm() { return this.omega / U.rpm; }
-  meanPistonSpeed() { return 2 * this.spec.stroke * Math.abs(this.omega) / ES_TAU; }
-  timingAdvance() { return (this.timingCurve.sample(Math.abs(this.rpm())) + this.options.timingOffset) * U.deg; }
-
-  // Cycle-averaged brake torque (Simulator::getFilteredDynoTorque uses the same binning).
-  averageTorque() { let s = 0; for (const v of this.torqueBins) s += v; return s / ES_TORQUE_BINS; }
-  averageDynoTorque() { let s = 0; for (const v of this.dynoBins) s += v; return s / ES_TORQUE_BINS; }
-
-  step() {
-    const dt = this.timestep, spec = this.spec, c = this.controls, n = spec.cylinders;
-    const r = this.crankRadius, L = spec.rod;
-    this.time += dt;
-
-    // Throttle linkage (DirectThrottleLinkage): plate position = 1 - pedal^gamma.
-    this.intake.throttle = 1 - Math.pow(esClamp(c.throttle), spec.intake.throttleGamma);
-
-    // 1. Crank dynamics from cylinder pressures.
-    let I = this.inertia, dI = 0, tau = 0, friction = 0;
-    const omega = this.omega;
-    for (let i = 0; i < n; i++) {
-      const a = this.localAngle(i), sa = Math.sin(a), ca = Math.cos(a);
-      const q = Math.sqrt(L * L - r * r * sa * sa);
-      const s1 = -r * sa - r * r * sa * ca / q;
-      const s2 = -r * ca - r * r * (ca * ca - sa * sa) / q - Math.pow(r, 4) * sa * sa * ca * ca / (q * q * q);
-      I += this.recipMass * s1 * s1;
-      dI += 2 * this.recipMass * s1 * s2;
-      const F = this.boreArea * (this.chambers[i].system.pressure() - ES_ATM);
-      tau -= F * s1;
-      // CombustionChamber::calculateFrictionForce with the cylinder wall force from rod angle.
-      const vs = s1 * omega, v = Math.abs(vs);
-      const wall = Math.abs(F) * Math.abs(r * sa / q);
-      const Fcoul = 0.06 * wall, vst = 0.1 * Math.SQRT2, vcoul = 0.01;
-      const F1 = v / vst;
-      const Ff = (Math.SQRT2 * Math.E * (50 - Fcoul) * Math.exp(-F1 * F1) * F1 + Fcoul * Math.tanh(v / vcoul) + 20 * v) * Math.min(v, 1e-3) / 1e-3;
-      friction += Ff * Math.abs(s1);
-    }
-    const engineTorque = tau - Math.sign(omega) * friction;
-    let w = omega + dt * (engineTorque - 0.5 * dI * omega * omega) / I;
-
-    // 2. Clutch and vehicle (Transmission + Vehicle + VehicleDragConstraint).
-    const gears = spec.transmission.gears, gear = Math.min(c.gear, gears.length);
-    const veh = spec.vehicle;
-    if (gear > 0) {
-      const ratio = gears[gear - 1] * veh.diffRatio;
-      const Iv = veh.mass * (veh.tireRadius / ratio) ** 2;
-      const wv = this.vehicleSpeed / veh.tireRadius * ratio;
-      const maxTc = esClamp(c.clutch) * spec.transmission.maxClutchTorque;
-      const Tc = esClamp((w - wv) / (dt * (1 / I + 1 / Iv)), -maxTc, maxTc);
-      w -= Tc * dt / I;
-      this.vehicleSpeed += Tc * ratio / veh.tireRadius * dt / veh.mass;
-    }
-    const rho = ES_AIR_MOLAR_MASS * ES_ATM / (ES_R * ES_T25);
-    const drag = veh.rollingResistance + 0.5 * rho * this.vehicleSpeed ** 2 * veh.dragCoefficient * veh.area + esClamp(c.brake) * veh.mass * 9.81;
-    this.vehicleSpeed = Math.max(0, this.vehicleSpeed - drag * dt / veh.mass);
-
-    // 3. Dynamometer (src/dynamometer.cpp): absorbs torque, or holds speed in hold mode.
-    let dynoTorque = 0;
-    if (c.dyno.enabled) {
-      const target = c.dyno.rpm * U.rpm, max = 10000 * U.lbft;
-      const needed = I * (target - w) / dt;
-      dynoTorque = esClamp(needed, -max, c.dyno.hold ? max : 0);
-      w += dynoTorque * dt / I;
-    }
-
-    // 4. Starter motor (src/starter_motor.cpp).
-    if (c.starter) {
-      const target = spec.starterSpeed * U.rpm;
-      if (w < target) w += Math.min(spec.starterTorque, I * (target - w) / dt) * dt / I;
-    }
-
-    // 5. Crankshaft friction and external load, as a Coulomb torque that never reverses rotation.
-    const coulomb = (spec.crankFriction + Math.max(0, c.load)) * dt / I;
-    w = Math.abs(w) <= coulomb ? 0 : w - Math.sign(w) * coulomb;
-
-    this.omega = w;
-    this.theta = esMod(this.theta + w * dt, ES_FOUR_PI * 1024);
-
-    // Cycle-averaged brake torque and dyno torque.
-    const cycle = this.cycleAngle();
-    const bin = Math.min(ES_TORQUE_BINS - 1, Math.floor(ES_TORQUE_BINS * cycle / ES_FOUR_PI));
-    const brake = engineTorque - Math.sign(omega) * spec.crankFriction;
-    if (bin !== this.lastBin) {
-      for (let k = (this.lastBin + 1) % ES_TORQUE_BINS; k !== bin; k = (k + 1) % ES_TORQUE_BINS) { this.torqueBins[k] = brake; this.dynoBins[k] = -dynoTorque; }
-      this.lastBin = bin;
-    }
-    this.torqueBins[bin] = brake; this.dynoBins[bin] = -dynoTorque;
-
-    // 6. Ignition module (src/ignition_module.cpp), for positive rotation.
-    for (let i = 0; i < n; i++) this.sparks[i] = Math.max(0, this.sparks[i] - dt);
-    if (c.ignition && this.revLimitTimer === 0) {
-      const advance = this.timingAdvance();
-      const r0 = this.lastCycleAngle, r1 = cycle;
-      for (let i = 0; i < n; i++) {
-        const spark = esMod(this.delta[i] - advance, ES_FOUR_PI);
-        const crossed = r1 >= r0 ? (spark >= r0 && spark < r1) : (spark >= r0 || spark < r1);
-        if (w > 0 && crossed) { this.chambers[i].ignite(); this.sparks[i] = 0.025; this.ignitionEvents++; }
-      }
-    }
-    this.revLimitTimer = Math.max(0, this.revLimitTimer - dt);
-    if (Math.abs(this.rpm()) > spec.revLimit) this.revLimitTimer = spec.limiterDuration;
-    this.lastCycleAngle = cycle;
-
-    // 7. Gas dynamics (PistonEngineSimulator::simulateStep_), 8 fluid substeps.
-    for (const ch of this.chambers) { ch.update(); ch.stepExhaustFlow = 0; ch.stepIntakeFlow = 0; }
-    const fluidDt = dt / 8;
-    for (let k = 0; k < 8; k++) {
-      for (const ex of this.exhausts) ex.process(fluidDt);
-      this.intake.process(fluidDt);
-      for (const ch of this.chambers) ch.flow(fluidDt);
-    }
-
-    // Trace of cylinder 1 for the oscilloscopes.
-    const ch1 = this.chambers[0], tb = Math.min(719, Math.floor(this.localAngle(0) / ES_FOUR_PI * 720)), t = this.trace;
-    t.pressure[tb] = ch1.system.pressure(); t.volume[tb] = ch1.system.V; t.moles[tb] = ch1.system.n;
-    t.temperature[tb] = ch1.system.temperature(); t.intake[tb] = ch1.stepIntakeFlow / dt; t.exhaust[tb] = ch1.stepExhaustFlow / dt;
-    t.intakeLift[tb] = ch1.intakeLift; t.exhaustLift[tb] = ch1.exhaustLift;
-  }
-
-  // PistonEngineSimulator::writeToSynthesizer: one input sample per exhaust system.
-  exhaustSignal(out) {
-    out[0] = 0; out[1] = 0;
-    const attenuation = Math.min(Math.abs(this.rpm()), 40) / 40, att3 = attenuation ** 3;
-    const n = this.spec.cylinders;
-    for (let i = 0; i < n; i++) {
-      const ch = this.chambers[i], er = ch.exhaustRunner;
-      const pulse = att3 * 1600 * ((er.pressure() - ES_ATM) + 0.1 * er.dynamicPressure(1, 0) + 0.1 * er.dynamicPressure(-1, 0));
-      const d = this.delays[i], buf = d.buffer;
-      const delayed = buf[d.index]; buf[d.index] = pulse; d.index = (d.index + 1) % buf.length;
-      const k = ch.exhaust === this.exhausts[0] ? 0 : 1;
-      out[k] += ch.soundAttenuation * (ch.exhaust.audioVolume * delayed / n) / (d.length * d.length);
-    }
-    return out;
-  }
-
-  // Readouts for the interface.
-  manifoldPressure() { return this.intake.system.pressure(); }
-  exhaustTemperature() { let s = 0; for (const ch of this.chambers) s += ch.exhaustRunner.temperature(); return s / this.chambers.length; }
-}
+const ES_ENGINE_ORDER = ['subaru_ej25', 'honda_b18c5', 'v6_60', 'gm_ls'];
 
 if (typeof module !== 'undefined') {
-  module.exports = { ES_ENGINES, ES_UNITS, ESEngineSimulation, ESSynthesizer, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicLobeTable };
+  module.exports = {
+    ES_ENGINES, ES_ENGINE_ORDER, ES_UNITS, ES_ATM, ESSimulator, ESEngine, ESSynthesizerInput, ESSynthesizerCore,
+    ESConvolution, ESFFT, ESButterworth, ESJitter, esImpulseResponse, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicCamLobe,
+  };
 }

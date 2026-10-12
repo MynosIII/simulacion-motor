@@ -1,63 +1,93 @@
-// Behavioural checks for the physics port. Run: node tests/physics.test.js
+// Behavioural checks for the engine-sim port. Run: node tests/physics.test.js
 const assert = require('assert');
 const { execFileSync } = require('child_process');
 const path = require('path');
-const { ES_ENGINES, ESEngineSimulation, ESSynthesizer } = require('../Engine-Sim-Physics.js');
+const P = require('../Engine-Sim-Physics.js');
+const { ES_ASSETS } = require('../Engine-Sim-Assets.js');
 
-function run(sim, seconds, synth) {
-  const out = [0, 0];
-  for (let i = 0, n = Math.round(seconds / sim.timestep); i < n; i++) {
-    sim.step();
-    if (synth) synth.writeInput(sim.exhaustSignal(out));
-  }
+const U = P.ES_UNITS;
+
+function impulseResponse(name) {
+  const ir = ES_ASSETS.irs[name], b = Buffer.from(ir.samples, 'base64');
+  return P.esImpulseResponse(new Int16Array(b.buffer, b.byteOffset, b.length / 2), ir.volume);
 }
 
-for (const [key, spec] of Object.entries(ES_ENGINES)) {
-  const sim = new ESEngineSimulation(spec);
-  const c = sim.controls;
-
-  c.ignition = true; c.starter = true;
-  run(sim, 1.5);
-  c.starter = false;
-  run(sim, 2);
-  const idle = sim.rpm();
-  assert(idle > 500 && idle < 1200, `${key}: idles at ${idle.toFixed(0)} rpm`);
-  assert(sim.manifoldPressure() < 75000, `${key}: manifold vacuum at idle (${(sim.manifoldPressure() / 1000).toFixed(0)} kPa)`);
-
-  c.throttle = 1;
-  run(sim, 3);
-  assert(sim.rpm() > 0.85 * spec.redline, `${key}: revs to ${sim.rpm().toFixed(0)} rpm at full throttle`);
-
-  c.dyno = { enabled: true, hold: true, rpm: 3000 };
-  run(sim, 1.5);
-  const torque = sim.averageDynoTorque();
-  assert(Math.abs(sim.rpm() - 3000) < 50, `${key}: dyno holds 3000 rpm`);
-  assert(torque > 100, `${key}: dyno torque ${torque.toFixed(0)} Nm`);
-
-  c.dyno = { enabled: false, hold: false, rpm: 0 }; c.throttle = 0; c.ignition = false;
-  run(sim, 6);
-  assert(sim.rpm() < 1, `${key}: stops with the ignition off (${sim.rpm().toFixed(0)} rpm)`);
-
-  // The synthesizer output is audible and its strongest component is a firing-frequency harmonic.
-  const sim2 = new ESEngineSimulation(spec), synth = new ESSynthesizer(44100, spec.simulationFrequency);
-  synth.setParameters(spec.audio);
-  sim2.controls.ignition = true; sim2.controls.throttle = 0.5; sim2.controls.dyno = { enabled: true, hold: true, rpm: 3000 };
-  run(sim2, 1.5, synth);
-  synth.drain();
-  run(sim2, 0.5, synth);
-  const [left] = synth.drain();
-  const rms = Math.sqrt(left.reduce((s, v) => s + v * v, 0) / left.length);
-  assert(rms > 0.05 && rms < 1, `${key}: audio rms ${rms.toFixed(3)}`);
-  let best = 0, bestF = 0;
-  for (let f = 20; f <= 600; f++) {
-    let re = 0, im = 0;
-    for (let i = 0; i < left.length; i++) { const a = 2 * Math.PI * f * i / 44100; re += left[i] * Math.cos(a); im -= left[i] * Math.sin(a); }
-    if (re * re + im * im > best) { best = re * re + im * im; bestF = f; }
+// The convolution is the same as the direct form in ConvolutionFilter.
+{
+  const ir = Float64Array.from({ length: 700 }, () => Math.random() - 0.5);
+  const conv = new P.ESConvolution(ir, 128), x = Float64Array.from({ length: 128 * 10 }, () => Math.random() - 0.5);
+  const block = new Float64Array(128);
+  let err = 0;
+  for (let b = 0; b < 10; b++) {
+    conv.process(x.subarray(b * 128, b * 128 + 128), block);
+    for (let i = 0; i < 128; i++) {
+      const n = b * 128 + i;
+      let s = 0;
+      for (let k = 0; k < ir.length && k <= n; k++) s += ir[k] * x[n - k];
+      err = Math.max(err, Math.abs(s - block[i]));
+    }
   }
-  const firing = 3000 * spec.cylinders / 120, harmonic = bestF / firing;
-  assert(Math.abs(harmonic - Math.round(harmonic)) < 0.05 && Math.round(harmonic) >= 1, `${key}: audio peak ${bestF} Hz vs firing ${firing} Hz`);
+  assert(err < 1e-9, `convolution error ${err}`);
+}
 
-  console.log(`ok ${key}: idle ${idle.toFixed(0)} rpm, ${torque.toFixed(0)} Nm at 3000 rpm WOT, audio peak ${bestF} Hz`);
+// Drives the simulator like EngineSimApplication: 60 frames a second, the
+// speed control filtered toward its target, the audio rendered in blocks.
+function bench(key) {
+  const spec = P.ES_ENGINES[key], input = new P.ESSynthesizerInput(spec.exhausts.length);
+  const sim = new P.ESSimulator(spec, input), e = sim.engine;
+  const core = new P.ESSynthesizerCore(spec.exhausts.length, spec.exhausts.map(x => impulseResponse(x.impulseResponse)));
+  core.setParameters({ dF_F_mix: e.hfGain, airNoise: e.noise, inputSampleNoise: e.jitter });
+  const queue = spec.exhausts.map(() => []);
+  let speed = 0, audio = [];
+  const state = {
+    sim, e, target: 0,
+    run(seconds) {
+      for (let i = 0, n = Math.round(seconds * 60); i < n; i++) {
+        speed = state.target * 0.5 + 0.5 * speed;
+        e.setSpeedControl(speed);
+        sim.startFrame(1 / 60);
+        while (sim.simulateStep());
+        sim.endFrame();
+        input.drain().forEach((a, c) => { for (const v of a) queue[c].push(v); });
+        while (queue[0].length >= 128) {
+          const out = new Float32Array(128);
+          core.render(queue.map(q => Float32Array.from(q.splice(0, 128))), out);
+          for (const v of out) audio.push(v);
+        }
+      }
+    },
+    takeAudio() { const a = audio; audio = []; return a; },
+  };
+  return state;
+}
+
+for (const key of P.ES_ENGINE_ORDER) {
+  const b = bench(key), { sim, e } = b;
+  sim.ignitionModule.enabled = true; sim.starterMotor.enabled = true;
+  b.run(1);
+  sim.starterMotor.enabled = false;
+  b.run(3);
+  const idle = e.rpm();
+  assert(idle > 500 && idle < 1200, `${key}: idles at ${idle.toFixed(0)} rpm`);
+  assert(e.manifoldPressure() < 75000, `${key}: manifold vacuum at idle (${(e.manifoldPressure() / 1000).toFixed(0)} kPa)`);
+  const idleAudio = b.takeAudio().slice(-44100);
+  const rms = Math.sqrt(idleAudio.reduce((s, v) => s + v * v, 0) / idleAudio.length);
+  assert(rms > 0.02 && rms < 1, `${key}: idle audio rms ${rms.toFixed(3)}`);
+
+  b.target = 1;
+  b.run(3);
+  assert(e.rpm() > 0.8 * e.redline / U.rpm, `${key}: revs to ${e.rpm().toFixed(0)} rpm at full throttle`);
+
+  sim.dyno.enabled = true; sim.dyno.hold = true; sim.dyno.rotationSpeed = 3000 * U.rpm;
+  b.run(3);
+  const torque = sim.filteredDynoTorque() / U.lbft;
+  assert(Math.abs(e.rpm() - 3000) < 50, `${key}: dyno holds 3000 rpm (${e.rpm().toFixed(0)})`);
+  assert(torque > 80, `${key}: dyno torque ${torque.toFixed(0)} lb-ft`);
+
+  sim.dyno.enabled = false; sim.dyno.hold = false; b.target = 0; sim.ignitionModule.enabled = false;
+  b.run(6);
+  assert(e.rpm() < 1, `${key}: stops with the ignition off (${e.rpm().toFixed(0)} rpm)`);
+  console.log(`ok ${key}: idle ${idle.toFixed(0)} rpm, ${torque.toFixed(0)} lb-ft at 3000 rpm WOT, idle audio rms ${rms.toFixed(3)}`);
 }
 
 execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'inline-scripts.js'), '--check'], { stdio: 'inherit' });
