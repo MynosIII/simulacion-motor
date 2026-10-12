@@ -90,4 +90,23 @@ for (const key of P.ES_ENGINE_ORDER) {
   console.log(`ok ${key}: idle ${idle.toFixed(0)} rpm, ${torque.toFixed(0)} lb-ft at 3000 rpm WOT, idle audio rms ${rms.toFixed(3)}`);
 }
 
+// Firing order: read from the plug angles, and rewired with the cams.
+{
+  const sim = new P.ESSimulator(P.ES_ENGINES.honda_b18c5);
+  assert.deepStrictEqual(sim.firingOrder(), [0, 2, 3, 1]);
+  assert(!sim.setFiringOrder([0, 1, 1, 3]), 'rejects an order that repeats a cylinder');
+  assert(sim.setFiringOrder([0, 1, 3, 2]));
+  assert.deepStrictEqual(sim.firingOrder(), [0, 1, 3, 2]);
+}
+
+// The output never reaches full scale, even on the loudest engine.
+{
+  const b = bench('gm_ls'), { sim } = b;
+  sim.ignitionModule.enabled = true; sim.starterMotor.enabled = true; b.run(1);
+  sim.starterMotor.enabled = false; b.run(2); b.target = 1; b.run(2);
+  const peak = b.takeAudio().reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  assert(peak < 0.999 && peak > 0.5, `gm_ls output peak ${peak.toFixed(3)}`);
+  console.log(`ok output peak ${peak.toFixed(3)}`);
+}
+
 execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'inline-scripts.js'), '--check'], { stdio: 'inherit' });

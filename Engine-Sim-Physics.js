@@ -701,8 +701,12 @@ class ESIgnitionModule {
     this.plugs = engine.cylinders.map(c => ({ angle: p.wires[c.wire], enabled: true, ignitionEvent: false }));
     this.enabled = false; this.revLimitTimer = 0;
     this.lastCrankshaftAngle = engine.cycleAngle();
+    // Engines that turn the other way give their timing as negative angles.
+    // The sign also says which way the plug angles advance in time.
+    this.direction = Math.sign(p.timing[p.timing.length - 1][1]) || 1;
+    this.timingOffset = 0;
   }
-  timingAdvance() { return this.timingCurve.sample(-this.engine.omega); }
+  timingAdvance() { return this.timingCurve.sample(-this.engine.omega) + this.direction * this.timingOffset; }
   update(dt) {
     const e = this.engine, cycleAngle = e.cycleAngle();
     if (this.enabled && this.revLimitTimer === 0) {
@@ -797,6 +801,31 @@ class ESSimulator {
   }
   timestep() { return 1 / this.simulationFrequency; }
   setSimulationFrequency(f) { this.simulationFrequency = f; }
+
+  // Not in engine-sim: the firing order as cylinder indices (0 based),
+  // starting at the first cylinder, read from the spark plug angles.
+  firingOrder() {
+    const plugs = this.ignitionModule.plugs, d = this.ignitionModule.direction;
+    const idx = plugs.map((_, i) => i).sort((a, b) => d * (plugs[a].angle - plugs[b].angle));
+    const k = idx.indexOf(0);
+    return idx.slice(k).concat(idx.slice(0, k));
+  }
+  // Moves each cylinder's spark and cam lobes to the slot its position in
+  // `order` asks for. The crankshaft is not changed, so an order that does not
+  // match its throws fires cylinders away from top dead center, like the real
+  // engine would. Returns false if `order` is not a permutation.
+  setFiringOrder(order) {
+    const plugs = this.ignitionModule.plugs, cyls = this.engine.cylinders, n = plugs.length;
+    if (order.length !== n || new Set(order).size !== n || order.some(c => !(c >= 0 && c < n))) return false;
+    const cams = c => { const vt = c.bank.head.valvetrain; return [vt.intakeCamshaft, vt.exhaustCamshaft, vt.vtecIntakeCamshaft, vt.vtecExhaustCamshaft].filter(Boolean); };
+    const slots = this.firingOrder().map(i => ({ angle: plugs[i].angle, lobes: cams(cyls[i]).map(cam => cam.lobeAngles[cyls[i].index]) }));
+    const k = order.indexOf(0), o = order.slice(k).concat(order.slice(0, k));
+    o.forEach((i, j) => {
+      plugs[i].angle = slots[j].angle;
+      cams(cyls[i]).forEach((cam, m) => { cam.lobeAngles[cyls[i].index] = slots[j].lobes[m]; });
+    });
+    return true;
+  }
 
   // Simulator::startFrame: the synthesizer input latency steers how many steps run.
   startFrame(dt, latency) {
@@ -1072,6 +1101,14 @@ class ESSynthesizerInput {
 
 // Synthesizer::renderAudio, block by block. Takes per-channel input at the audio
 // rate and returns int16-scaled samples divided by 32768.
+const ES_LEVELER_LOOKAHEAD = 48;
+// Linear up to the knee, then a smooth curve that never passes full scale.
+function esSoftClip(x) {
+  const knee = 0.8, a = Math.abs(x);
+  if (a <= knee) return x;
+  return Math.sign(x) * (knee + (1 - knee) * Math.tanh((a - knee) / (1 - knee)));
+}
+
 class ESSynthesizerCore {
   constructor(channels, impulseResponses, audioRate = 44100, block = 128) {
     this.channels = channels; this.audioRate = audioRate; this.block = block;
@@ -1112,20 +1149,24 @@ class ESSynthesizerCore {
       flt.convolution.process(vIn, this.vConv);
       for (let i = 0; i < B; i++) sum[i] += conv * this.vConv[i] + (1 - conv) * vIn[i];
     }
+    // LevelingFilter (src/leveling_filter.cpp). The gain follows the peak of
+    // the live signal but is applied to a copy delayed by a few samples, so a
+    // firing pulse is turned down before it reaches the output instead of
+    // being hard clipped at int16 like the original does on loud engines.
+    const look = this.lookahead || (this.lookahead = new Float64Array(ES_LEVELER_LOOKAHEAD));
     for (let i = 0; i < B; i++) {
       const signal = this.antialiasing.f(sum[i]);
-      // LevelingFilter (src/leveling_filter.cpp)
       this.peak *= 0.999;
       if (Math.abs(signal) > this.peak) this.peak = Math.abs(signal);
-      let leveled = 0;
+      const delayed = look[this.lookN = ((this.lookN | 0) + 1) % look.length];
+      look[this.lookN] = signal;
       if (this.peak !== 0) {
         const raw = Math.min(Math.max(p.levelerTarget / this.peak, p.levelerMinGain), p.levelerMaxGain);
         this.attenuation = 0.9 * this.attenuation + 0.1 * raw;
-        leveled = signal * this.attenuation;
       }
-      let v = Math.round(leveled * p.volume);
-      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-      output[i] = v / 32768;
+      const v = delayed * this.attenuation * p.volume / 32768;
+      if (v > 1 || v < -1) this.overs = (this.overs | 0) + 1;
+      output[i] = esSoftClip(v);
     }
   }
 }

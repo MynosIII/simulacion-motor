@@ -1069,7 +1069,7 @@ class ESSynthProcessor extends AudioWorkletProcessor {
       this.cap = 1 << 17; this.mask = this.cap - 1;
       this.buf = Array.from({ length: d.channels }, () => new Float32Array(this.cap));
       this.ins = Array.from({ length: d.channels }, () => new Float32Array(128));
-      this.r = 0; this.w = 0; this.consumed = 0; this.blocks = 0;
+      this.r = 0; this.w = 0; this.consumed = 0; this.blocks = 0; this.underruns = 0; this.clipped = 0;
       this.wave = new Float32Array(256); this.waveN = 0;
     } else if (d.type === 'input' && this.core && d.epoch === this.epoch) {
       const n = d.data[0].length;
@@ -1085,10 +1085,10 @@ class ESSynthProcessor extends AudioWorkletProcessor {
       for (let c = 0; c < this.channels; c++) { const b = this.buf[c], dst = this.ins[c]; for (let i = 0; i < out.length; i++) dst[i] = b[(this.r + i) & this.mask]; }
       this.core.render(this.ins, out);
       this.r += out.length; this.consumed += out.length;
-    } else out.fill(0);
+    } else { out.fill(0); if (this.consumed > 0) this.underruns++; }
     for (let i = 0; i < out.length; i += 4) this.wave[this.waveN++] = out[i];
     if (++this.blocks % 4 === 0) {
-      this.port.postMessage({ epoch: this.epoch, consumed: this.consumed, queued: this.w - this.r, gain: this.core.attenuation, wave: this.wave.slice(0, this.waveN) });
+      this.port.postMessage({ epoch: this.epoch, consumed: this.consumed, queued: this.w - this.r, underruns: this.underruns, clipped: this.core.overs | 0, gain: this.core.attenuation, wave: this.wave.slice(0, this.waveN) });
       this.waveN = 0;
     }
     return true;
@@ -1098,13 +1098,186 @@ registerProcessor('es-synth', ESSynthProcessor);
 `;
 
 function esWorkletSource() {
-  return [ESButterworth, ESJitter, ESFFT, ESConvolution, ESSynthesizerCore].map(c => c.toString()).join('\n') + ES_WORKLET_PROCESSOR;
+  return `const ES_LEVELER_LOOKAHEAD = ${ES_LEVELER_LOOKAHEAD};\n` + [esSoftClip, ESButterworth, ESJitter, ESFFT, ESConvolution, ESSynthesizerCore].map(c => c.toString()).join('\n') + ES_WORKLET_PROCESSOR;
 }
 
 function esDecodeInt16(base64) {
   const bin = atob(base64), bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new Int16Array(bytes.buffer);
+}
+
+/* ------------------------------------------------------- Page controls */
+
+// Not in engine-sim: an engine bar above the simulator and a panel of live
+// controls below it, so the engine can be driven without the keyboard. They
+// write the same state the keys do, and show what the keys changed.
+const ES_ENGINE_BAR_SLOTS = 6;
+const ES_SIM_SPEEDS = [[1, 'Tiempo real'], [1 / 10, '1/10'], [1 / 100, '1/100'], [1 / 200, '1/200'], [1 / 500, '1/500'], [1 / 1000, '1/1000']];
+
+function esEl(tag, attrs = {}, children = []) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'text') el.textContent = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) if (c) el.append(c);
+  return el;
+}
+
+class ESEngineBar {
+  constructor(app, host) {
+    this.app = app; this.buttons = [];
+    const list = esEl('div', { class: 'engine-list', role: 'tablist', 'aria-label': 'Motores' });
+    ES_ENGINE_ORDER.forEach((key, i) => {
+      const b = esEl('button', { type: 'button', role: 'tab', class: 'engine', onclick: () => app.selectEngine(i) },
+        [esEl('span', { class: 'engine-name', text: ES_ENGINES[key].name }), esEl('span', { class: 'engine-meta', text: esEngineSummary(ES_ENGINES[key]) })]);
+      this.buttons.push(b); list.append(b);
+    });
+    for (let i = ES_ENGINE_ORDER.length; i < ES_ENGINE_BAR_SLOTS; i++) {
+      list.append(esEl('button', { type: 'button', class: 'engine', disabled: '' },
+        [esEl('span', { class: 'engine-name', text: 'Próximamente' }), esEl('span', { class: 'engine-meta', text: 'Motor ' + (i + 1) })]));
+    }
+    host.append(list, esEl('a', { class: 'to-controls', href: '#controls', text: 'Controles ↓' }));
+    this.update();
+  }
+  update() { this.buttons.forEach((b, i) => b.setAttribute('aria-selected', String(i === this.app.engineIndex))); }
+}
+
+function esEngineSummary(spec) {
+  const n = spec.banks.reduce((s, b) => s + b.cylinders.length, 0);
+  return `${n} cil. · ${Math.round(Math.abs(spec.redline) / ES_UNITS.rpm)} rpm`;
+}
+
+class ESControlPanel {
+  constructor(app, host) {
+    this.app = app; this.host = host; this.lastSync = 0;
+    const range = (label, min, max, step, value, oninput, fmt) => {
+      const out = esEl('output'), input = esEl('input', { type: 'range', min, max, step, value });
+      const show = () => { out.textContent = fmt(+input.value); };
+      input.addEventListener('input', () => { oninput(+input.value); show(); });
+      show();
+      return { input, out, show, row: esEl('label', { class: 'row' }, [esEl('span', { text: label }), input, out]) };
+    };
+    const toggle = (label, onclick) => {
+      const b = esEl('button', { type: 'button', class: 'toggle', 'aria-pressed': 'false', text: label, onclick });
+      return b;
+    };
+    const group = (title, hint, rows) => esEl('section', { class: 'group' }, [esEl('h2', { text: title }), hint && esEl('p', { class: 'hint', text: hint }), ...rows]);
+
+    // Driving
+    this.ignition = toggle('Encendido · A', () => this.app.setIgnition(!this.app.simulator.ignitionModule.enabled));
+    this.starter = esEl('button', { type: 'button', class: 'toggle', text: 'Arranque · mantener S' });
+    const hold = on => ev => { ev.preventDefault(); this.app.panel.starter = on; };
+    this.starter.addEventListener('pointerdown', hold(true));
+    for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) this.starter.addEventListener(ev, hold(false));
+    this.throttle = range('Acelerador', 0, 100, 1, 0, v => { this.app.panel.throttle = v / 100; }, v => v + ' %');
+    this.simSpeed = esEl('select', { onchange: () => { this.app.panel.simSpeed = +this.simSpeed.value; } },
+      ES_SIM_SPEEDS.map(([v, t]) => esEl('option', { value: v, text: t })));
+    const drive = group('Conducción', 'Q, W, E y R aceleran mientras se mantienen. El acelerador de acá queda fijo.', [
+      esEl('div', { class: 'buttons' }, [this.ignition, this.starter]),
+      this.throttle.row,
+      esEl('label', { class: 'row' }, [esEl('span', { text: 'Velocidad de simulación' }), this.simSpeed, esEl('output')]),
+    ]);
+
+    // Load
+    this.dyno = toggle('Dinamómetro · D', () => this.app.setDyno(!this.app.simulator.dyno.enabled));
+    this.hold = toggle('Mantener RPM · H', () => this.app.setHold(!this.app.simulator.dyno.hold));
+    this.holdRpm = range('RPM objetivo', 500, 9000, 100, 3000, v => this.app.setDynoSpeed(v * ES_UNITS.rpm), v => v + ' rpm');
+    this.gear = esEl('select', { onchange: () => this.app.setGear(+this.gear.value) });
+    this.clutch = range('Embrague', 0, 100, 1, 100, v => { this.app.panel.clutch = v / 100; }, v => v === 100 ? 'acoplado' : v === 0 ? 'pisado' : v + ' %');
+    const load = group('Carga del motor', 'Con el dinamómetro y "mantener RPM" el banco frena el motor a las RPM objetivo y mide el torque.', [
+      esEl('div', { class: 'buttons' }, [this.dyno, this.hold]),
+      this.holdRpm.row,
+      esEl('label', { class: 'row' }, [esEl('span', { text: 'Marcha · ↑ ↓' }), this.gear, esEl('output')]),
+      this.clutch.row,
+    ]);
+
+    // Ignition
+    this.order = esEl('input', { type: 'text', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Orden de encendido' });
+    this.orderNote = esEl('p', { class: 'hint' });
+    const applyOrder = () => {
+      const order = this.order.value.split(/[^0-9]+/).filter(Boolean).map(x => +x - 1);
+      this.orderNote.textContent = this.app.simulator.setFiringOrder(order)
+        ? 'Aplicado. Si no coincide con el cigüeñal, el motor falla o no arranca.'
+        : `Escribí cada cilindro del 1 al ${this.app.simulator.engine.cylinders.length} una vez, por ejemplo ${this.defaultOrder}.`;
+      this.syncOrder(true);
+    };
+    this.order.addEventListener('keydown', ev => { if (ev.key === 'Enter') applyOrder(); });
+    this.plugs = esEl('div', { class: 'plugs' });
+    this.advance = range('Avance extra', -20, 20, 1, 0, v => { this.app.panel.timingOffset = v; this.app.simulator.ignitionModule.timingOffset = v * ES_UNITS.deg; }, v => (v > 0 ? '+' : '') + v + '°');
+    const ignition = group('Encendido', 'Cambiar el orden mueve la chispa y las levas de cada cilindro. Apagá bujías para escuchar un cilindro muerto.', [
+      esEl('div', { class: 'row' }, [esEl('span', { text: 'Orden de encendido' }), esEl('div', { class: 'order' }, [this.order,
+        esEl('button', { type: 'button', text: 'Aplicar', onclick: applyOrder }),
+        esEl('button', { type: 'button', text: 'Original', onclick: () => { this.order.value = this.defaultOrder; applyOrder(); } })])]),
+      this.orderNote,
+      esEl('div', { class: 'row' }, [esEl('span', { text: 'Bujías' }), this.plugs]),
+      this.advance.row,
+    ]);
+
+    // Sound
+    const audio = (label, name, max, fmt) => range(label, 0, max, max / 100, this.app.audioParams[name], v => this.app.setAudioParameters({ [name]: v }), fmt);
+    this.audioRanges = {
+      volume: audio('Volumen · Z', 'volume', 1, v => Math.round(v * 100) + ' %'),
+      convolution: audio('Convolución · X', 'convolution', 1, v => Math.round(v * 100) + ' %'),
+      airNoise: audio('Ruido de baja frec. · V', 'airNoise', 1, v => Math.round(v * 100) + ' %'),
+      inputSampleNoise: audio('Ruido de alta frec. · B', 'inputSampleNoise', 1, v => Math.round(v * 100) + ' %'),
+    };
+    this.audioStatus = esEl('p', { class: 'hint' });
+    const sound = group('Sonido', null, [...Object.values(this.audioRanges).map(r => r.row), this.audioStatus]);
+
+    this.readout = esEl('div', { class: 'readout', 'aria-live': 'off' });
+    host.append(esEl('div', { class: 'panel-head' }, [esEl('h1', { text: 'Controles' }), this.readout]),
+      esEl('div', { class: 'groups' }, [drive, load, ignition, sound]));
+    this.engineChanged();
+  }
+
+  // Called after an engine is loaded.
+  engineChanged() {
+    const app = this.app, sim = app.simulator, e = sim.engine;
+    this.defaultOrder = sim.firingOrder().map(i => i + 1).join('-');
+    this.order.value = this.defaultOrder; this.orderNote.textContent = '';
+    this.gear.replaceChildren(esEl('option', { value: -1, text: 'Neutral' }),
+      ...sim.transmission.gearRatios.map((r, i) => esEl('option', { value: i, text: `${i + 1}ª (${r.toFixed(2)})` })));
+    this.plugs.replaceChildren(...e.cylinders.map((c, i) => {
+      const b = esEl('button', { type: 'button', class: 'toggle plug', 'aria-pressed': 'true', text: String(i + 1), title: 'Bujía del cilindro ' + (i + 1) });
+      b.addEventListener('click', () => {
+        const plug = app.simulator.ignitionModule.plugs[i];
+        plug.enabled = !plug.enabled; b.setAttribute('aria-pressed', String(plug.enabled));
+      });
+      return b;
+    }));
+    const max = Math.ceil(Math.abs(e.redline) / ES_UNITS.rpm / 500) * 500;
+    this.holdRpm.input.max = max;
+    sim.ignitionModule.timingOffset = app.panel.timingOffset * ES_UNITS.deg;
+    for (const [name, r] of Object.entries(this.audioRanges)) { r.input.value = app.audioParams[name]; r.show(); }
+    this.sync(true);
+  }
+  syncOrder(force) {
+    if (!force && document.activeElement === this.order) return;
+    this.order.value = this.app.simulator.firingOrder().map(i => i + 1).join('-');
+  }
+  // Shows state the keyboard changed. Runs a few times a second.
+  sync(force) {
+    const now = performance.now();
+    if (!force && now - this.lastSync < 150) return;
+    this.lastSync = now;
+    const app = this.app, sim = app.simulator, e = sim.engine, t = sim.transmission;
+    const press = (b, on) => b.setAttribute('aria-pressed', String(on));
+    press(this.ignition, sim.ignitionModule.enabled);
+    press(this.starter, sim.starterMotor.enabled);
+    press(this.dyno, sim.dyno.enabled);
+    press(this.hold, sim.dyno.hold);
+    if (document.activeElement !== this.gear) this.gear.value = t.gear;
+    for (const [name, r] of Object.entries(this.audioRanges)) if (document.activeElement !== r.input && +r.input.value !== app.audioParams[name]) { r.input.value = app.audioParams[name]; r.show(); }
+    const torque = sim.filteredDynoTorque() / ES_UNITS.lbft, power = sim.dynoPower() / 745.699872;
+    this.readout.textContent = `${Math.abs(e.rpm()).toFixed(0)} rpm · ${(e.manifoldPressure() / 1000).toFixed(0)} kPa` +
+      (sim.dyno.enabled ? ` · ${torque.toFixed(0)} lb-ft · ${power.toFixed(0)} hp` : '');
+    const a = app.audio;
+    this.audioStatus.textContent = !a ? 'El sonido arranca con el primer clic o tecla.'
+      : `Audio a ${a.ctx.sampleRate} Hz · ${((a.sent - a.consumed) / a.rate * 1000).toFixed(0)} ms en cola · cortes ${a.underruns || 0} · saturación ${a.clipped || 0}`;
+  }
 }
 
 /* -------------------------------------------------- EngineSimApplication */
@@ -1127,6 +1300,7 @@ class ESApp {
     this.mouse = [0, 0]; this.mouseDown = false; this.mousePressed = false; this.mouseReleased = false; this.wheel = 0;
     this.lastMouseWheel = 0; this.uiLastScroll = 0; this.hover = null; this.dragStart = null; this.mouse0 = [0, 0];
     this.audio = null; this.levelerGain = 1; this.oscillatorSampleOffset = 0;
+    this.panel = { throttle: 0, starter: false, clutch: 1, simSpeed: 1, timingOffset: 0 };
 
     this.root = new ESUiElement(this);
     this.engineView = this.root.add(new ESEngineView(this));
@@ -1142,6 +1316,9 @@ class ESApp {
     const requested = params.get('engine');
     this.engineIndex = Math.max(0, ES_ENGINE_ORDER.indexOf(requested));
     this.loadEngine(ES_ENGINE_ORDER[this.engineIndex]);
+    const bar = document.getElementById('engine-bar'), controls = document.getElementById('controls');
+    this.engineBar = bar ? new ESEngineBar(this, bar) : null;
+    this.controlPanel = controls ? new ESControlPanel(this, controls) : null;
     this.bindInput();
     this.resize();
   }
@@ -1162,6 +1339,8 @@ class ESApp {
     this.targetClutchPressure = 1; this.clutchPressure = 1;
     this.oscCluster.resetScopes(); this.loadSimulationCluster.resetReadings();
     if (this.audio) this.sendEngineToAudio();
+    if (this.engineBar) this.engineBar.update();
+    if (this.controlPanel) this.controlPanel.engineChanged();
   }
   impulseResponses() {
     return this.simulator.engine.exhausts.map(ex => {
@@ -1174,26 +1353,60 @@ class ESApp {
     a.epoch++; a.sent = 0; a.consumed = 0; a.queued = 0;
     a.node.port.postMessage({ type: 'load', epoch: a.epoch, channels: this.synthInput.channels, irs: this.impulseResponses(), params: this.audioParams });
   }
-  nextEngine(step) {
-    this.engineIndex = (this.engineIndex + step + ES_ENGINE_ORDER.length) % ES_ENGINE_ORDER.length;
-    this.loadEngine(ES_ENGINE_ORDER[this.engineIndex]);
+  nextEngine(step) { this.selectEngine((this.engineIndex + step + ES_ENGINE_ORDER.length) % ES_ENGINE_ORDER.length); }
+  selectEngine(index) {
+    this.engineIndex = index;
+    this.loadEngine(ES_ENGINE_ORDER[index]);
     this.infoCluster.setLogMessage('Loaded ' + this.simulator.engine.name);
+    const url = new URL(location.href);
+    url.searchParams.set('engine', ES_ENGINE_ORDER[index]);
+    history.replaceState(null, '', url);
+  }
+  // The keys and the control panel change the simulator through these.
+  setIgnition(on) {
+    this.simulator.ignitionModule.enabled = on;
+    this.infoCluster.setLogMessage(on ? 'IGNITION ENABLED' : 'IGNITION DISABLED');
+  }
+  setDyno(on) {
+    this.simulator.dyno.enabled = on;
+    this.infoCluster.setLogMessage(on ? 'DYNOMOMETER ENABLED' : 'DYNOMOMETER DISABLED');
+  }
+  setHold(on) {
+    const sim = this.simulator;
+    sim.dyno.hold = on;
+    if (on && this.controlPanel) this.setDynoSpeed(+this.controlPanel.holdRpm.input.value * ES_UNITS.rpm);
+    this.infoCluster.setLogMessage(on ? (sim.dyno.enabled ? 'HOLD ENABLED' : 'HOLD ON STANDBY [ENABLE DYNO. FOR HOLD]') : 'HOLD DISABLED');
+  }
+  setDynoSpeed(w) {
+    const e = this.simulator.engine;
+    this.dynoSpeed = esClamp(w, e.dynoMinSpeed, e.dynoMaxSpeed);
+  }
+  setGear(gear) {
+    const t = this.simulator.transmission;
+    t.changeGear(gear);
+    this.infoCluster.setLogMessage(t.gear === -1 ? 'SHIFTED TO NEUTRAL' : 'SHIFTED TO ' + (t.gear + 1));
   }
   async startAudio() {
     if (this.audio || this.audioStarting) return;
     this.audioStarting = true;
     try {
       const ctx = new AudioContext({ sampleRate: 44100, latencyHint: 'interactive' });
-      await ctx.audioWorklet.addModule('data:text/javascript;charset=utf-8,' + encodeURIComponent(esWorkletSource()));
+      // Resume inside the click or key press that started the audio; some
+      // browsers refuse once an await has ended the user gesture.
+      const resumed = ctx.resume();
+      const url = URL.createObjectURL(new Blob([esWorkletSource()], { type: 'text/javascript' }));
+      try { await ctx.audioWorklet.addModule(url); }
+      catch (err) { await ctx.audioWorklet.addModule('data:text/javascript;charset=utf-8,' + encodeURIComponent(esWorkletSource())); }
+      finally { URL.revokeObjectURL(url); }
       const epoch = 1;
       const node = new AudioWorkletNode(ctx, 'es-synth', {
         numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1],
         processorOptions: { type: 'load', epoch, channels: this.synthInput.channels, irs: this.impulseResponses(), params: this.audioParams },
       });
       node.connect(ctx.destination);
-      this.audio = { ctx, node, epoch, sent: 0, consumed: 0, queued: 0 };
+      this.audio = { ctx, node, epoch, rate: ctx.sampleRate, sent: 0, consumed: 0, queued: 0, underruns: 0, clipped: 0 };
       node.port.onmessage = ev => this.audioMessage(ev.data);
-      await ctx.resume();
+      await resumed;
     } catch (err) {
       this.infoCluster.setLogMessage('Audio unavailable: ' + err.message);
       console.error(err);
@@ -1203,7 +1416,7 @@ class ESApp {
   audioMessage(d) {
     const a = this.audio;
     if (d.epoch !== a.epoch) return;
-    a.consumed = d.consumed; a.queued = d.queued; this.levelerGain = d.gain;
+    a.consumed = d.consumed; a.queued = d.queued; a.underruns = d.underruns; a.clipped = d.clipped; this.levelerGain = d.gain;
     const scope = this.oscCluster.audioWaveformScope;
     for (let i = 0; i < d.wave.length; i++) {
       scope.addDataPoint(this.oscillatorSampleOffset, d.wave[i]);
@@ -1214,18 +1427,21 @@ class ESApp {
     Object.assign(this.audioParams, p);
     if (this.audio) this.audio.node.port.postMessage({ type: 'params', params: this.audioParams });
   }
-  synthesizerInputLatency() { return this.audio ? (this.audio.sent - this.audio.consumed) / 44100 : 0; }
+  synthesizerInputLatency() { return this.audio ? (this.audio.sent - this.audio.consumed) / this.audio.rate : 0; }
   pixelsToUnits(px) { return px * this.displayHeight / this.engineView.bounds.height(); }
 
   /* --------------------------------------------------------------- input */
   bindInput() {
     const prevent = new Set(['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'F1', 'F2', 'F3', 'Enter', 'PageUp', 'PageDown']);
+    const typing = ev => ev.target instanceof Element && ev.target.matches('input[type=text], select, textarea');
     addEventListener('keydown', ev => {
+      this.startAudio();
+      if (typing(ev)) return;
       if (prevent.has(ev.code)) ev.preventDefault();
       if (!ev.repeat) this.pressed.add(ev.code);
       this.keys.add(ev.code);
-      this.startAudio();
     });
+    addEventListener('pointerdown', () => this.startAudio());
     addEventListener('keyup', ev => { this.keys.delete(ev.code); });
     addEventListener('blur', () => this.keys.clear());
     const toLogical = ev => {
@@ -1234,11 +1450,15 @@ class ESApp {
     };
     this.canvas.addEventListener('pointerdown', ev => {
       this.mouse = toLogical(ev); this.mouseDown = true; this.mousePressed = true;
-      this.canvas.setPointerCapture(ev.pointerId); this.startAudio();
+      this.canvas.setPointerCapture(ev.pointerId);
     });
     this.canvas.addEventListener('pointermove', ev => { this.mouse = toLogical(ev); });
     this.canvas.addEventListener('pointerup', ev => { this.mouse = toLogical(ev); this.mouseDown = false; this.mouseReleased = true; });
+    // The page scrolls down to the controls, so the wheel only reaches the
+    // simulator with one of its keys held, or Ctrl or Alt to zoom the engine.
+    const wheelKeys = ['Space', 'KeyZ', 'KeyX', 'KeyC', 'KeyV', 'KeyB', 'KeyN', 'KeyG'];
     this.canvas.addEventListener('wheel', ev => {
+      if (!ev.ctrlKey && !ev.altKey && !wheelKeys.some(k => this.keys.has(k))) return;
       ev.preventDefault();
       // Windows reports 120 per notch; browsers report about 100 pixels.
       const unit = ev.deltaMode === 1 ? 40 : ev.deltaMode === 2 ? 800 : 1;
@@ -1250,7 +1470,11 @@ class ESApp {
   keyPressed(code) { const p = this.pressed.has(code); this.pressed.delete(code); return p; }
   shiftDown() { return this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'); }
   resize() {
-    const cw = innerWidth, ch = innerHeight, dpr = devicePixelRatio || 1;
+    // The simulator fills the window below the engine bar; the controls sit
+    // under it and the page scrolls to them.
+    const bar = document.getElementById('engine-bar');
+    const cw = document.documentElement.clientWidth || innerWidth, dpr = devicePixelRatio || 1;
+    const ch = Math.max(360, innerHeight - (bar ? bar.offsetHeight : 0));
     // The original lays out in screen pixels with fixed text sizes, so small
     // windows get a larger logical resolution that is scaled down to fit.
     const k = Math.max(1, 1920 / cw, 1080 / ch);
@@ -1290,7 +1514,7 @@ class ESApp {
       fineInUse = true;
     }
     const prevTarget = this.targetSpeedSetting;
-    this.targetSpeedSetting = fine ? this.targetSpeedSetting : 0;
+    this.targetSpeedSetting = fine ? this.targetSpeedSetting : this.panel.throttle;
     if (this.keyDown('KeyQ')) this.targetSpeedSetting = 0.01;
     else if (this.keyDown('KeyW')) this.targetSpeedSetting = 0.1;
     else if (this.keyDown('KeyE')) this.targetSpeedSetting = 0.2;
@@ -1309,14 +1533,8 @@ class ESApp {
       if (this.layer0 - 1 >= 0) this.layer0--;
       info.setLogMessage('[,] - Set render layer to ' + this.layer0);
     }
-    if (this.keyPressed('KeyD')) {
-      sim.dyno.enabled = !sim.dyno.enabled;
-      info.setLogMessage(sim.dyno.enabled ? 'DYNOMOMETER ENABLED' : 'DYNOMOMETER DISABLED');
-    }
-    if (this.keyPressed('KeyH')) {
-      sim.dyno.hold = !sim.dyno.hold;
-      info.setLogMessage(sim.dyno.hold ? (sim.dyno.enabled ? 'HOLD ENABLED' : 'HOLD ON STANDBY [ENABLE DYNO. FOR HOLD]') : 'HOLD DISABLED');
-    }
+    if (this.keyPressed('KeyD')) this.setDyno(!sim.dyno.enabled);
+    if (this.keyPressed('KeyH')) this.setHold(!sim.dyno.hold);
     if (sim.dyno.enabled) {
       if (!sim.dyno.hold) {
         if (sim.filteredDynoTorque() > ES_UNITS.lbft) this.dynoSpeed += 500 * ES_UNITS.rpm * dt;
@@ -1328,12 +1546,9 @@ class ESApp {
     sim.dyno.rotationSpeed = this.dynoSpeed;
 
     const prevStarter = sim.starterMotor.enabled;
-    sim.starterMotor.enabled = this.keyDown('KeyS');
+    sim.starterMotor.enabled = this.keyDown('KeyS') || this.panel.starter;
     if (prevStarter !== sim.starterMotor.enabled) info.setLogMessage(sim.starterMotor.enabled ? 'STARTER ENABLED' : 'STARTER DISABLED');
-    if (this.keyPressed('KeyA')) {
-      sim.ignitionModule.enabled = !sim.ignitionModule.enabled;
-      info.setLogMessage(sim.ignitionModule.enabled ? 'IGNITION ENABLED' : 'IGNITION DISABLED');
-    }
+    if (this.keyPressed('KeyA')) this.setIgnition(!sim.ignitionModule.enabled);
     const t = sim.transmission;
     if (this.keyPressed('ArrowUp')) {
       t.changeGear(t.gear + 1);
@@ -1345,7 +1560,7 @@ class ESApp {
     if (this.keyDown('KeyT')) this.targetClutchPressure -= 0.2 * dt;
     else if (this.keyDown('KeyU')) this.targetClutchPressure += 0.2 * dt;
     else if (this.shiftDown()) { this.targetClutchPressure = 0; info.setLogMessage('CLUTCH DEPRESSED'); }
-    else if (!this.keyDown('KeyY')) this.targetClutchPressure = 1;
+    else if (!this.keyDown('KeyY')) this.targetClutchPressure = this.panel.clutch;
     this.targetClutchPressure = esClamp(this.targetClutchPressure);
     const clutchRC = fine ? 1 : 0.001, s = dt / (dt + clutchRC);
     this.clutchPressure = this.clutchPressure * (1 - s) + this.targetClutchPressure * s;
@@ -1356,7 +1571,7 @@ class ESApp {
   process(frameDt) {
     frameDt = esClamp(frameDt, 1 / 200, 1 / 30);
     const sim = this.simulator;
-    let speed = 1;
+    let speed = this.panel.simSpeed;
     for (const [code, s] of Object.entries(ES_SPEED_KEYS)) if (this.keyDown(code)) { speed = s; break; }
     if (this.keyDown('F1')) this.displayAngle += frameDt;
     else if (this.keyDown('F2')) this.displayAngle -= frameDt;
@@ -1478,6 +1693,7 @@ class ESApp {
     this.renderScene();
     const t2 = performance.now();
     this.timing = { process: t1 - t0, render: t2 - t1 };
+    if (this.controlPanel) this.controlPanel.sync();
     this.pressed.clear();
   }
   run() {

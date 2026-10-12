@@ -25,10 +25,24 @@ La página es un port de engine-sim: la misma pantalla (vista del motor en corte
 | Tab | Cambiar pantalla (completa, solo motor, motor + relojes) |
 | F | Pantalla completa |
 | Enter | Recargar el motor |
-| Arrastrar / rueda sobre el motor | Mover / acercar la vista |
+| Arrastrar / Ctrl o Alt + rueda sobre el motor | Mover / acercar la vista (la rueda sola baja a los controles) |
 | Clic en los osciloscopios chicos | Mostrarlos en el grande |
 
 Agregados del port: clic en el nombre del motor o RePág / AvPág para cambiar de motor, y `?engine=gm_ls` en la dirección para abrir uno en particular.
+
+## Barra de motores y panel de controles (agregados del port)
+
+- Arriba, una barra con los motores guardados en el proyecto. Tiene seis lugares; los que todavía no tienen motor dicen "Próximamente". Para sumar uno se agrega su descripción a `ES_ENGINES` y su clave a `ES_ENGINE_ORDER` en Engine-Sim-Physics.js.
+- Abajo de la pantalla (bajando con la rueda o con "Controles ↓"), un panel para probar en vivo:
+  - Conducción: encendido, arranque, acelerador fijo y velocidad de simulación.
+  - Carga del motor: dinamómetro, mantener RPM con RPM objetivo, marcha y embrague.
+  - Encendido: orden de encendido editable (mueve la chispa y las levas de cada cilindro; el cigüeñal no cambia, así que un orden que no le corresponde hace fallar el motor), bujías que se pueden apagar por cilindro y avance extra de encendido.
+  - Sonido: volumen, convolución y ruidos, con el estado del audio (cola, cortes y saturación).
+- El panel y las teclas manejan el mismo estado: lo que se cambia con el teclado se ve en el panel.
+
+## Sonido
+
+El nivelador del original multiplica la señal sin mirar adelante, así que en los motores más fuertes (V6 y LS) los picos de cada explosión pasaban del máximo y se recortaban en seco. Acá el nivelador mide el pico 48 muestras antes de aplicarlo y la salida pasa por un limitador suave, así que no hay recorte.
 
 ## Motores
 
