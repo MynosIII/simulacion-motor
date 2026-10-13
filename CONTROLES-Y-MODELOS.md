@@ -1,35 +1,85 @@
 # Engine Lab en navegador
 
-Abrir Engine-Lab-Local.html en Chrome o Edge. También se puede servir ese mismo HTML en cualquier hosting estático. No necesita login, servidor de aplicaciones, librerías externas ni conexión a internet.
+Abrir Engine-Lab-Local.html en Chrome, Edge o Firefox. También se puede servir ese mismo HTML en cualquier hosting estático. No necesita servidor, librerías externas ni conexión a internet.
 
-## Controles disponibles
+La página es un port de engine-sim: la misma pantalla (vista del motor en corte, relojes, osciloscopios, colores y tipografía Silkscreen), la misma simulación y la misma cadena de sonido. El navegador solo permite audio después de un clic o una tecla; el recuadro sobre la vista del motor lo indica.
 
-- Encendido A, arranque S, acelerador Q/W/E/R y Espacio, carga, volumen.
-- Barrido D con CSV y RPM hold H con objetivo ajustable.
-- Marchas ↑/↓, embrague Shift y freno con punto. Modelo reducido del vehículo.
-- Mezclador: ganancia previa, convolución con respuesta de impulso original, agudos, ruido LF/HF y compresión de picos. Medidor de salida en dBFS RMS.
-- Velocidad de simulación, vista en tiempo real o lenta, pausa, avance angular y pantalla completa F.
-- Orden de encendido, squish visual, relación de compresión, avance fijo, alzada y duración nominal de leva. Resolución de leva ajustable.
-- Modelo de vibración: masa alternativa, masa del bloque, frecuencia natural y amortiguamiento de soportes. Ampliación visual independiente del valor RMS.
+## Controles (los del original)
 
-## Gráficos
+| Tecla | Acción |
+|---|---|
+| A | Encendido |
+| S (mantener) | Motor de arranque |
+| Q / W / E / R | Acelerador al 1 %, 10 %, 20 % y 100 % |
+| Espacio + rueda | Control fino del acelerador; con Espacio el embrague responde lento |
+| D | Dinamómetro (barrido hasta el corte) |
+| H | Mantener RPM con el dinamómetro; G + rueda cambia la velocidad |
+| ↑ / ↓ | Subir / bajar marcha |
+| Shift (mantener) | Pisar el embrague; T / U lo ajustan, Y lo mantiene |
+| Z / X / C / V / B + rueda | Volumen, convolución, ganancia de agudos, ruido de graves, ruido de agudos |
+| N + rueda | Frecuencia de simulación |
+| 1 a 5 (mantener) | Cámara lenta (1/10 a 1/1000) |
+| F1 / F2 / F3 | Rotar la vista / volver al frente |
+| M / , | Capa de dibujo (cilindros más atrás) |
+| I | Mostrar potencia y par máximos |
+| Tab | Cambiar pantalla (completa, solo motor, motor + relojes) |
+| O | Vista: corte, paralela al cigüeñal o ambas (agregado del port) |
+| F | Pantalla completa |
+| Enter | Recargar el motor |
+| Arrastrar / Ctrl o Alt + rueda sobre el motor | Mover / acercar la vista (la rueda sola baja a los controles) |
+| Clic en los osciloscopios chicos | Mostrarlos en el grande |
 
-1. Alzada de válvulas: perfil armónico adaptado del original.
-2. Presión del cilindro vs. ángulo: modelo polytropico ilustrativo.
-3. Presión–volumen: mismo modelo aproximado.
-4. Caudal de admisión y escape: aproximación a partir de alzada y RPM.
-5. Moles del cilindro: aproximación con gas ideal.
-6. Avance vs. RPM: muestra el ajuste fijo actual, no una tabla de avance editable.
-7. RPM vs. tiempo: historial real del modelo web.
-8. Vibración vs. tiempo: desplazamiento estimado del bloque, muestreado por el renderizado.
-9. Forma de onda: muestras reales de la salida de Web Audio.
-10. Espectro: FFT real de la salida de Web Audio.
-11. Potencia y par: curvas del barrido, con datos estimados y exportación CSV.
+Agregados del port: clic en el nombre del motor o RePág / AvPág para cambiar de motor, y `?engine=gm_ls` en la dirección para abrir uno en particular.
+
+## Barra de motores y panel de controles (agregados del port)
+
+- Arriba, una barra con los motores guardados en el proyecto y los botones de vista (Corte, Cigüeñal, Ambas). Tiene seis lugares; los que todavía no tienen motor dicen "Próximamente". Para sumar uno se agrega su descripción a `ES_ENGINES` y su clave a `ES_ENGINE_ORDER` en Engine-Sim-Physics.js.
+- Abajo de la pantalla (bajando con la rueda o con "Controles ↓"), un panel para probar en vivo:
+  - Conducción: encendido, arranque, acelerador fijo, velocidad de simulación y frecuencia de simulación.
+  - Carga del motor: dinamómetro, mantener RPM con RPM objetivo, marcha y embrague.
+  - Encendido: orden de encendido editable (mueve la chispa y las levas de cada cilindro; el cigüeñal no cambia, así que un orden que no le corresponde hace fallar el motor), bujías que se pueden apagar por cilindro y avance extra de encendido.
+  - Sonido: volumen, convolución y ruidos, con el estado del audio (cola, cortes y saturación).
+- El panel y las teclas manejan el mismo estado: lo que se cambia con el teclado se ve en el panel.
+
+## Vista paralela al cigüeñal (agregado del port)
+
+Muestra el motor de costado, con el cigüeñal acostado a lo ancho y todos los cilindros a la vez: camisas, pistones, bielas, un solo cigüeñal con sus codos (muñones, brazos, contrapesos y muñequillas en la posición real de cada uno) y el número de cilindro en naranja cuando enciende. Es una proyección de las posiciones de la simulación: en un motor en línea se mira a lo largo de los cilindros, en un V por el medio de la V (las dos bancadas un poco acortadas) y en un bóxer desde arriba, con una bancada sobre el cigüeñal y la otra debajo. Por defecto se ve debajo del corte; con O o los botones de vista se elige una sola.
+
+engine-sim es 2D y no guarda dónde está cada cilindro a lo largo del cigüeñal. Acá los cilindros se ordenan por muñón (los que comparten muñón, uno al lado del otro), y un motor puede dar su orden con `axialOrder`. El EJ25 lo usa para que el cigüeñal quede 0-180-180-0 con las bancadas alternadas, como el motor real.
+
+En las dos vistas el gas de cada cámara tiene color: azul la mezcla fresca, gris los gases quemados (según cuánto oxígeno y combustible le queda comparado con la admisión) y naranja la llama.
+
+## Vibración
+
+Al cargar cada motor se calculan, con su propia geometría de biela y manivela, las fuerzas y momentos libres de las masas alternativas (pistón y un tercio de la biela) durante un ciclo de 720°, separados por orden del cigüeñal. Un orden k vibra a k × rpm / 60 Hz. Se supone que los contrapesos anulan la parte de primer orden que gira con el cigüeñal; lo que queda necesitaría un eje de balanceo. Los pulsos de encendido agregan siempre un par al orden cilindros / 2. La vista del cigüeñal muestra la vibración principal en vivo y el panel "Vibración" lista los órdenes.
+
+Los momentos usan esa misma ubicación a lo largo del cigüeñal. Resultados con los motores actuales: el Honda (I4) tiene la fuerza de segundo orden típica de los cuatro en línea; el EJ25 (bóxer) el momento de segundo orden típico de los bóxer de cuatro; el LS (V8 cruzado) queda balanceado y vibra por los pulsos de encendido (orden 4); el V6 a 60° muestra un momento de segundo orden. Con el motor parado no hay frecuencia; se muestra solo el orden.
+
+## Frecuencia de simulación
+
+Casi todo el trabajo de la página es la física (en esta computadora, unas 20 veces lo que cuesta el sintetizador). Los motores del original piden 10 o 20 kHz; la página los corre a 8 kHz, que reduce a menos de la mitad el costo de los motores de 20 kHz y deja ralentí y torque dentro de unos pocos por ciento. En el panel se puede volver a la frecuencia original de cada motor o bajarla a 6 kHz. El sonido sale de esa misma simulación, así que con menos frecuencia suena un poco más opaco.
+
+## Sonido
+
+El nivelador del original multiplica la señal sin mirar adelante, así que en los motores más fuertes (V6 y LS) los picos de cada explosión pasaban del máximo y se recortaban en seco. Acá el nivelador mide el pico 48 muestras antes de aplicarlo y la salida pasa por un limitador suave, así que no hay recorte.
+
+## Motores
+
+- Subaru EJ25 (por defecto, como en el original): assets/engines/atg-video-2/01_subaru_ej25_eh.mr.
+- Honda B18C5 con VTEC: assets/engines/atg-video-1/05_honda_vtec.mr.
+- V6 60°: assets/engines/atg-video-2/04_60_degree_v6.mr.
+- GM LS V8: assets/engines/atg-video-2/07_gm_ls.mr.
+
+Cada motor usa su respuesta de impulso de escape original.
 
 ## Límites respecto al original
 
-No están portados el solver C++ de restricciones mecánicas, gases y combustión, el intérprete de archivos .mr, el sintetizador C++ completo ni su frecuencia de simulación. Tampoco se implementó VTEC, el editor de curvas de avance o la interacción completa vehículo–transmisión del original. La interfaz muestra los controles disponibles y no usa controles simulados para afirmar que esas funciones existen.
+- El original resuelve cigüeñal, bielas y pistones como cuerpos rígidos con un solver de restricciones (scs). Acá el cigüeñal es un único grado de libertad, los pistones y bielas siguen la cinemática exacta de biela y manivela y la inercia depende del ángulo. Arranque, freno dinamométrico, rozamiento, embrague y resistencia del vehículo usan los mismos límites de par, resueltos por impulsos.
+- Los motores están transcriptos a mano desde los .mr; no está portado el intérprete de scripts.
+- La salida de audio va directo a Web Audio desde un AudioWorklet, sin el búfer intermedio del original; el reloj LATENCY mide la cola de entrada del sintetizador más la latencia del dispositivo.
 
-El cálculo de vibración usa fuerzas inerciales de primer y segundo orden y respuesta armónica de soportes elásticos. No incluye pulsos de combustión, deformación del cigüeñal ni calibración experimental. Los valores son para comparar el modelo, no para predecir un motor real. Las fases de cilindros siguen siendo virtuales, según el orden de encendido elegido.
+## Desarrollo
 
-La presión, caudales, temperatura, AFR y rendimiento no son resultados del motor físico original. El código trasladado y su licencia figuran en PROCEDENCIA.md y dentro del HTML.
+- `node tests/physics.test.js` arranca cada motor, comprueba ralentí, acelerador a fondo, dinamómetro a 3000 RPM, apagado y nivel de audio, compara la convolución con la forma directa y verifica que el HTML tenga la última versión de los scripts.
+- `node tools/inline-scripts.js` copia Engine-Sim-Assets.js, Engine-Sim-Physics.js y Engine-Sim-UI.js dentro de Engine-Lab-Local.html. Correrlo después de editar esos archivos.
+- tools/assets tiene los scripts que extrajeron los modelos, la fuente y las respuestas de impulso (ver PROCEDENCIA.md).
