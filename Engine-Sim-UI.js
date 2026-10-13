@@ -956,6 +956,16 @@ class ESScene {
         }
         // CombustionChamberObject
         const chamber = e.chambers[i];
+        // Not in engine-sim: the gas between the crown and the head, blue for
+        // fresh mixture and grey for burned gas, under the flame.
+        if (sub === 0 && this.foremost(bank, L0) === cyl) {
+          const roof = bank.deckHeight + bank.head.chamberVolume / bank.boreArea, crown = cyl.s + ch + wp;
+          if (roof > crown) push(0x34, () => {
+            p.begin();
+            p.line(bank.x + bank.dx * crown, bank.y + bank.dy * crown, bank.x + bank.dx * roof, bank.y + bank.dy * roof, bank.bore);
+            p.fill(esChamberGasColor(app, chamber));
+          });
+        }
         if (this.foremost(bank, L0) === cyl && chamber.lit) {
           const h = bank.head.chamberVolume / bank.boreArea, f = chamber.flame;
           const top = bank.deckHeight + h, bottom = bank.deckHeight + h - f.travelY;
@@ -1063,38 +1073,50 @@ class ESCrankView extends ESUiElement {
     const banks = e.banks.slice(0, 2), crank = e.crank, r = crank.throw;
     const cx = crank.x || 0, cy = crank.y || 0, nJ = crank.journals.length;
     const bore = Math.max(...banks.map(k => k.bore)), pitch = bore * 1.25, lw = bore * 0.1;
-    const headH = bore * 0.35, ch = e.pistonSpec.compressionHeight, skirt = bore * 0.45;
+    const headH = bore * 0.35, ch = e.pistonSpec.compressionHeight, wp = e.pistonSpec.wristPinPosition || 0, skirt = bore * 0.45;
     const top = Math.max(...banks.map(k => k.deckHeight + k.head.chamberVolume / k.boreArea)) + headH;
-    const inner = b.inset(14), iw = inner.width(), ih = inner.height() - 40;
-    // Two banks either face each other across one crankshaft (tall), or sit
-    // side by side, each over its own copy of it (wide); the one that draws
-    // larger in this frame wins.
+    const inner = b.inset(14), iw = inner.width(), ih = inner.height() - 70;
+    // Two-bank engines (V and boxer) get one row per bank, side by side, each
+    // over its own copy of the crankshaft seen along that bank.
     const bankLength = nJ * pitch + pitch * 0.4, gap = pitch * 0.6, below = r * 1.8;
-    const mirrored = { w: bankLength, h: banks.length > 1 ? 2 * top : top + below };
-    const sideBySide = { w: banks.length * bankLength + (banks.length - 1) * gap, h: top + below };
-    const fit = l => Math.min(iw / l.w, ih / l.h);
-    const split = banks.length > 1 && fit(sideBySide) > fit(mirrored);
-    const lay = split ? sideBySide : mirrored, ppu = fit(lay);
-    const yMin = lay === mirrored && banks.length > 1 ? -top : -below;
-    const ox = (inner.x0 + inner.x1) / 2, oy = inner.y0 + (ih - lay.h * ppu) / 2 - yMin * ppu;
+    const lay = { w: banks.length * bankLength + (banks.length - 1) * gap, h: top + below };
+    const ppu = Math.min(iw / lay.w, ih / lay.h), yMin = -below;
+    const ox = (inner.x0 + inner.x1) / 2, oy = inner.y0 + 30 + (ih - lay.h * ppu) / 2 - yMin * ppu;
     const grey = v => esMix(colors.background, colors.foreground, v);
     const labels = [];
-    const shaft = x0 => {
-      const z = j => x0 + (j - (nJ - 1) / 2) * pitch;
-      p.begin(); p.line(z(0) - pitch * 0.7, 0, z(nJ - 1) + pitch * 0.7, 0, r * 0.45); p.fill(grey(0.6));
-      p.begin(); p.line(z(nJ - 1) + pitch * 0.55, -r * 1.7, z(nJ - 1) + pitch * 0.55, r * 1.7, pitch * 0.18); p.fill(grey(0.45));
+    // Crankshaft seen across: main journals on the axis, and for every throw
+    // two webs out to the crank pin with counterweights opposite. Pin heights
+    // are the crank pins projected on the bank's cylinder axis.
+    const crankshaft = (x0, ux, uy) => {
+      const z = j => x0 + (j - (nJ - 1) / 2) * pitch, tw = pitch * 0.62, webT = pitch * 0.13;
+      const pinY = j => { const phi = e.theta + crank.journals[j]; return r * (Math.cos(phi) * ux + Math.sin(phi) * uy); };
+      p.begin();
+      p.line(z(0) - pitch * 0.7, 0, z(0) - tw / 2, 0, r * 0.5);
+      for (let j = 0; j + 1 < nJ; j++) p.line(z(j) + tw / 2, 0, z(j + 1) - tw / 2, 0, r * 0.5);
+      p.line(z(nJ - 1) + tw / 2, 0, z(nJ - 1) + pitch * 0.62, 0, r * 0.5);
+      p.fill(grey(0.6));
+      p.begin(); p.line(z(nJ - 1) + pitch * 0.62, -r * 1.8, z(nJ - 1) + pitch * 0.62, r * 1.8, pitch * 0.18); p.fill(grey(0.45));
+      for (let j = 0; j < nJ; j++) {
+        const y = pinY(j);
+        p.begin();
+        for (const side of [-1, 1]) {
+          const xw = z(j) + side * (tw / 2 - webT / 2);
+          p.line(xw, -0.6 * y, xw, y, webT);
+          p.circle(xw, -0.6 * y, r * 0.4);
+        }
+        p.fill(grey(0.7));
+        p.begin(); p.line(z(j) - tw / 2 + webT, y, z(j) + tw / 2 - webT, y, r * 0.5); p.fill(grey(0.85));
+      }
     };
 
     ctx.save();
     ctx.beginPath(); ctx.rect(b.x0, b.y0, b.width(), b.height()); ctx.clip();
     ctx.translate(ox, oy); ctx.scale(ppu, ppu);
-    if (!split) shaft(0);
 
     banks.forEach((bank, bi) => {
-      const sign = split || bi === 0 ? 1 : -1;
-      const x0 = split ? (bi - (banks.length - 1) / 2) * (bankLength + gap) : 0;
+      const sign = 1, x0 = (bi - (banks.length - 1) / 2) * (bankLength + gap);
       const z = j => x0 + (j - (nJ - 1) / 2) * pitch;
-      if (split) shaft(x0);
+      crankshaft(x0, bank.dx, bank.dy);
       const along = (x, y) => (x - cx) * bank.dx + (y - cy) * bank.dy;
       const h = bank.head.chamberVolume / bank.boreArea, base = along(bank.x || 0, bank.y || 0);
       const deck = base + bank.deckHeight, roof = deck + h, liner = base + (1 - bank.displayDepth) * bank.deckHeight;
@@ -1105,27 +1127,23 @@ class ESCrankView extends ESUiElement {
       for (const cyl of bank.cylinders) {
         const i = cyl.global, x = z(cyl.journal), chamber = e.chambers[i];
         const pin = along(cyl.pinX, cyl.pinY), crankPin = along(cyl.journalX, cyl.journalY);
-        const wall = bank.bore / 2 + lw / 2;
+        const wall = bank.bore / 2 + lw / 2, crown = pin + ch + wp;
         // Liner walls.
         p.begin();
         p.line(x - wall, sign * liner, x - wall, sign * roof, lw);
         p.line(x + wall, sign * liner, x + wall, sign * roof, lw);
         p.fill(colors.pink);
-        // Crank web and counterweight, then the crank pin.
-        p.begin(); p.line(x, -sign * r * 0.75, x, sign * crankPin, bank.bore * 0.32); p.fill(grey(0.7));
-        p.begin(); p.circle(x, sign * crankPin, r * 0.32); p.fill(grey(0.8));
-        // Connecting rod.
-        p.begin(); p.line(x, sign * crankPin, x, sign * pin, r * 0.45); p.fill(grey(0.9333));
-        // Flame between the crown and the head.
-        const crown = pin + ch;
+        // Gas above the piston: fresh mixture blue, burned gas grey, flame orange.
+        p.begin(); p.line(x, sign * crown, x, sign * roof, bank.bore); p.fill(esChamberGasColor(app, chamber));
         if (chamber.lit) {
           const depth = Math.min(chamber.flame.travelY, roof - crown), width = Math.min(chamber.flame.travelX * 2, bank.bore);
-          p.begin(); p.line(x, sign * roof, x, sign * (roof - depth), width); p.fill(colors.orange.slice(0, 3).concat([0.6]));
+          p.begin(); p.line(x, sign * roof, x, sign * (roof - depth), width); p.fill(colors.orange.slice(0, 3).concat([0.8]));
         }
-        // Piston and wrist pin.
+        // Connecting rod, piston and wrist pin.
+        p.begin(); p.line(x, sign * crankPin, x, sign * pin, r * 0.45); p.fill(grey(0.9333));
         p.begin(); p.line(x, sign * (pin - skirt), x, sign * crown, bank.bore * 0.96); p.fill(colors.foreground);
         p.begin(); p.circle(x, sign * pin, bank.bore / 10 * 0.75); p.fill(colors.background);
-        labels.push([String(i + 1), ox + x * ppu, oy + sign * (roof + headH + bore * 0.12) * ppu + (sign > 0 ? 0 : -18), chamber.lit]);
+        labels.push([String(i + 1), ox + x * ppu, oy + (roof + headH + bore * 0.12) * ppu, chamber.lit]);
       }
     });
     ctx.restore();
@@ -1136,7 +1154,26 @@ class ESCrankView extends ESUiElement {
     this.drawText('CRANKSHAFT VIEW', b.inset(10), 16);
     const order = app.simulator.firingOrder().map(i => i + 1).join('-');
     this.drawAlignedText('FIRING ORDER ' + order, b.inset(10), 16, [1, 1], [1, 1]);
+    const v = app.vibrationNow();
+    this.drawText(`VIBRATION ${esFixed(v.hz, 1)} HZ  ORDER ${v.order} ${v.kind.toUpperCase()}`, ESBounds.sized(b.width() - 20, 26, b.x0 + 10, b.y0 + 26, ESRef.tl), 16);
+    // Legend.
+    const lx = b.x1 - 10;
+    let x = lx;
+    for (const [t, c] of [['FLAME', colors.orange], ['EXHAUST', esMix(colors.background, colors.foreground, 0.4)], ['MIXTURE', colors.blue]]) {
+      const w = p.textWidth(t, 14);
+      x -= w; p.text(t, x, b.y0 + 12, 14, c); x -= 16;
+    }
   }
+}
+
+// Not in engine-sim: the colour of the gas in a chamber, from how much of it
+// is fresh charge (oxygen and fuel, against what the intake holds) and how
+// much is burned gas.
+function esChamberGasColor(app, chamber) {
+  const intake = app.simulator.engine.intake.system, sys = chamber.system;
+  const fresh = intake.o2 + intake.fuel > 0 ? esClamp((sys.o2 + sys.fuel) / (intake.o2 + intake.fuel)) : 0;
+  const c = esMix(esMix(app.colors.background, app.colors.foreground, 0.4), app.colors.blue, fresh);
+  return c.slice(0, 3).concat([0.85]);
 }
 
 /* ------------------------------------------------------------ Audio output */
@@ -1330,12 +1367,14 @@ class ESControlPanel {
       airNoise: audio('Ruido de baja frec. · V', 'airNoise', 1, v => Math.round(v * 100) + ' %'),
       inputSampleNoise: audio('Ruido de alta frec. · B', 'inputSampleNoise', 1, v => Math.round(v * 100) + ' %'),
     };
+    this.vibrationList = esEl('div', { class: 'vibration' });
+    const vibration = group('Vibración', 'Calculada con la geometría de cada motor: fuerzas y momentos libres de pistones y bielas por orden del cigüeñal (orden k vibra a k × rpm / 60), suponiendo contrapesos que anulan la parte que gira con el cigüeñal. Los momentos toman los cilindros en el orden de la vista del cigüeñal.', [this.vibrationList]);
     this.audioStatus = esEl('p', { class: 'hint' });
     const sound = group('Sonido', null, [...Object.values(this.audioRanges).map(r => r.row), this.audioStatus]);
 
     this.readout = esEl('div', { class: 'readout', 'aria-live': 'off' });
     host.append(esEl('div', { class: 'panel-head' }, [esEl('h1', { text: 'Controles' }), this.readout]),
-      esEl('div', { class: 'groups' }, [drive, load, ignition, sound]));
+      esEl('div', { class: 'groups' }, [drive, load, ignition, vibration, sound]));
     this.engineChanged();
   }
 
@@ -1381,6 +1420,13 @@ class ESControlPanel {
     const torque = sim.filteredDynoTorque() / ES_UNITS.lbft, power = sim.dynoPower() / 745.699872;
     this.readout.textContent = `${Math.abs(e.rpm()).toFixed(0)} rpm · ${(e.manifoldPressure() / 1000).toFixed(0)} kPa` +
       (sim.dyno.enabled ? ` · ${torque.toFixed(0)} lb-ft · ${power.toFixed(0)} hp` : '');
+    const v = app.vibrationNow(), kinds = { force: 'fuerza libre', moment: 'momento libre', torque: 'pulsos de encendido' };
+    const rows = [['Principal', `${v.hz.toFixed(1)} Hz`, `orden ${v.order}, ${kinds[v.kind]}`],
+      ['Giro del cigüeñal', `${v.rps.toFixed(1)} Hz`, 'orden 1'],
+      ['Encendido', `${v.firingHz.toFixed(1)} Hz`, `orden ${app.vibration.firingOrder}, par`],
+      ...app.vibration.orders.slice(1, 4).map(o => ['Además', `${(o.order * v.rps).toFixed(1)} Hz`, `orden ${o.order}, ${kinds[o.kind]} ${o.amplitude.toFixed(2)}`])];
+    if (!app.vibration.orders.length) rows.push(['Desbalance', '—', 'fuerzas y momentos libres balanceados']);
+    this.vibrationList.replaceChildren(...rows.map(([a, b, c]) => esEl('div', { class: 'vrow' }, [esEl('span', { text: a }), esEl('strong', { text: b }), esEl('span', { class: 'muted', text: c })])));
     const a = app.audio;
     this.audioStatus.textContent = !a ? 'El sonido arranca con el primer clic o tecla.'
       : `Audio a ${a.ctx.sampleRate} Hz · ${((a.sent - a.consumed) / a.rate * 1000).toFixed(0)} ms en cola · cortes ${a.underruns || 0} · saturación ${a.clipped || 0}`;
@@ -1449,6 +1495,7 @@ class ESApp {
     this.targetSpeedSetting = 0; this.speedSetting = 0; this.dynoSpeed = 0;
     this.targetClutchPressure = 1; this.clutchPressure = 1;
     this.oscCluster.resetScopes(); this.loadSimulationCluster.resetReadings();
+    this.vibration = esVibrationAnalysis(e);
     if (this.audio) this.sendEngineToAudio();
     if (this.engineBar) this.engineBar.update();
     if (this.controlPanel) this.controlPanel.engineChanged();
@@ -1491,6 +1538,12 @@ class ESApp {
   setDynoSpeed(w) {
     const e = this.simulator.engine;
     this.dynoSpeed = esClamp(w, e.dynoMinSpeed, e.dynoMaxSpeed);
+  }
+  // The main vibration at the current speed: the strongest free force or
+  // moment, or the firing pulses when the engine is balanced.
+  vibrationNow() {
+    const v = this.vibration, d = v.dominant, rps = Math.abs(this.simulator.engine.rpm()) / 60;
+    return { order: d.order, kind: d.kind, hz: d.order * rps, rps, firingHz: v.firingOrder * rps };
   }
   setSimulationFrequency(f) {
     this.panel.simFrequency = f;

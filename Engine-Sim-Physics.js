@@ -1170,6 +1170,56 @@ class ESSynthesizerCore {
     }
   }
 }
+/* ---------------------------------------------------------------- Vibration */
+
+// Not in engine-sim. Free shaking forces and rocking moments of the
+// reciprocating masses (piston plus a third of the rod), from the engine's own
+// slider-crank geometry over one 720° cycle, split into crank orders. An order
+// k vibrates at k × rpm / 60 Hz. The first order part that turns with the crank
+// is left out, since crank counterweights cancel it; what is left needs a
+// balance shaft or is felt. Journals are taken 1.25 bores apart for moments.
+// The firing pulses add a torque at order cylinders / 2.
+function esVibrationAnalysis(engine) {
+  const N = 720, maxHalfOrder = 24, cyls = engine.cylinders, nJ = engine.crank.journals.length;
+  const m = engine.pistonSpec.mass + engine.rodSpec.mass / 3, r = engine.crank.throw;
+  const pitch = 1.25 * Math.max(...engine.banks.map(b => b.bore));
+  const theta0 = engine.theta;
+  const fx = new Float64Array(N), fy = new Float64Array(N), mx = new Float64Array(N), my = new Float64Array(N);
+  for (let n = 0; n < N; n++) {
+    engine.theta = 2 * ES_TAU * n / N;
+    engine.computeGeometry();
+    for (const c of cyls) {
+      const f = m * c.dds, z = (c.journal - (nJ - 1) / 2) * pitch;
+      const x = f * c.bank.dx, y = f * c.bank.dy;
+      fx[n] += x; fy[n] += y; mx[n] -= z * y; my[n] += z * x;
+    }
+  }
+  engine.theta = theta0; engine.computeGeometry();
+  // Amplitudes of the parts of a 2D signal turning with and against the crank.
+  const rotating = (a, b, k) => {
+    let ar = 0, ai = 0, br = 0, bi = 0;
+    for (let n = 0; n < N; n++) {
+      const t = 2 * ES_TAU * n / N * k, c = Math.cos(t), s = Math.sin(t);
+      ar += a[n] * c; ai -= a[n] * s; br += b[n] * c; bi -= b[n] * s;
+    }
+    ar *= 2 / N; ai *= 2 / N; br *= 2 / N; bi *= 2 / N;
+    // X + iY and X - iY with X = ar + i ai, Y = br + i bi.
+    return { with: Math.hypot(ar - bi, ai + br) / 2, against: Math.hypot(ar + bi, ai - br) / 2 };
+  };
+  const orders = [], forceUnit = m * r, momentUnit = m * r * pitch;
+  for (let h = 1; h <= maxHalfOrder; h++) {
+    const k = h / 2;
+    for (const [kind, a, b, unit] of [['force', fx, fy, forceUnit], ['moment', mx, my, momentUnit]]) {
+      const p = rotating(a, b, k), amp = (k === 1 ? p.against : p.with + p.against) / unit;
+      if (amp > 0.05) orders.push({ order: k, kind, amplitude: amp });
+    }
+  }
+  const firingOrder = cyls.length / 2;
+  orders.sort((a, b) => b.amplitude - a.amplitude);
+  const dominant = orders.length ? orders[0] : { order: firingOrder, kind: 'torque', amplitude: 0 };
+  return { orders, firingOrder, dominant };
+}
+
 /* ------------------------------------------------------------------ Engines */
 
 // Engine descriptions transcribed from the engine-sim scripts in assets/engines.
@@ -1408,6 +1458,6 @@ const ES_ENGINE_ORDER = ['subaru_ej25', 'honda_b18c5', 'v6_60', 'gm_ls'];
 if (typeof module !== 'undefined') {
   module.exports = {
     ES_ENGINES, ES_ENGINE_ORDER, ES_UNITS, ES_ATM, ESSimulator, ESEngine, ESSynthesizerInput, ESSynthesizerCore,
-    ESConvolution, ESFFT, ESButterworth, ESJitter, esImpulseResponse, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicCamLobe,
+    ESConvolution, ESFFT, ESButterworth, ESJitter, esImpulseResponse, esVibrationAnalysis, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicCamLobe,
   };
 }
