@@ -43,7 +43,9 @@ Agregados del port: clic en el nombre del motor o RePág / AvPág para cambiar d
 
 ## Vista paralela al cigüeñal (agregado del port)
 
-Muestra el motor con el cigüeñal acostado a lo ancho: todos los cilindros a la vez, con camisas, pistones, bielas, el cigüeñal con sus codos (muñones, brazos, contrapesos y muñequillas en la posición real de cada uno) y el número de cilindro en naranja cuando enciende. Las posiciones son las de la simulación, proyectadas sobre el eje de cada bancada; en motores de dos bancadas (V o bóxer) cada bancada se dibuja de frente, una al lado de la otra, sobre su propia copia del cigüeñal. Por defecto se ve debajo del corte; con O o los botones de vista se elige una sola.
+Muestra el motor de costado, con el cigüeñal acostado a lo ancho y todos los cilindros a la vez: camisas, pistones, bielas, un solo cigüeñal con sus codos (muñones, brazos, contrapesos y muñequillas en la posición real de cada uno) y el número de cilindro en naranja cuando enciende. Es una proyección de las posiciones de la simulación: en un motor en línea se mira a lo largo de los cilindros, en un V por el medio de la V (las dos bancadas un poco acortadas) y en un bóxer desde arriba, con una bancada sobre el cigüeñal y la otra debajo. Por defecto se ve debajo del corte; con O o los botones de vista se elige una sola.
+
+engine-sim es 2D y no guarda dónde está cada cilindro a lo largo del cigüeñal. Acá los cilindros se ordenan por muñón (los que comparten muñón, uno al lado del otro), y un motor puede dar su orden con `axialOrder`. El EJ25 lo usa para que el cigüeñal quede 0-180-180-0 con las bancadas alternadas, como el motor real.
 
 En las dos vistas el gas de cada cámara tiene color: azul la mezcla fresca, gris los gases quemados (según cuánto oxígeno y combustible le queda comparado con la admisión) y naranja la llama.
 
@@ -51,7 +53,7 @@ En las dos vistas el gas de cada cámara tiene color: azul la mezcla fresca, gri
 
 Al cargar cada motor se calculan, con su propia geometría de biela y manivela, las fuerzas y momentos libres de las masas alternativas (pistón y un tercio de la biela) durante un ciclo de 720°, separados por orden del cigüeñal. Un orden k vibra a k × rpm / 60 Hz. Se supone que los contrapesos anulan la parte de primer orden que gira con el cigüeñal; lo que queda necesitaría un eje de balanceo. Los pulsos de encendido agregan siempre un par al orden cilindros / 2. La vista del cigüeñal muestra la vibración principal en vivo y el panel "Vibración" lista los órdenes.
 
-Los momentos dependen de dónde está cada cilindro a lo largo del cigüeñal. engine-sim es 2D y no lo guarda, así que se toman los cilindros en el orden de la vista, separados 1,25 diámetros. Resultados con los motores actuales: el Honda (I4) tiene la fuerza de segundo orden típica de los cuatro en línea; el LS (V8 cruzado) queda balanceado y vibra por los pulsos de encendido (orden 4); el V6 a 60° muestra un momento de segundo orden; en el EJ25 el orden de los muñones del script deja un momento de primer orden que un bóxer real no tiene.
+Los momentos usan esa misma ubicación a lo largo del cigüeñal. Resultados con los motores actuales: el Honda (I4) tiene la fuerza de segundo orden típica de los cuatro en línea; el EJ25 (bóxer) el momento de segundo orden típico de los bóxer de cuatro; el LS (V8 cruzado) queda balanceado y vibra por los pulsos de encendido (orden 4); el V6 a 60° muestra un momento de segundo orden. Con el motor parado no hay frecuencia; se muestra solo el orden.
 
 ## Frecuencia de simulación
 

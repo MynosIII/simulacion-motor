@@ -552,6 +552,7 @@ class ESEngine {
     const crank = spec.crankshaft;
     this.name = spec.name;
     this.redline = spec.redline; this.starterTorque = spec.starterTorque; this.starterSpeed = spec.starterSpeed;
+    this.axialOrder = spec.axialOrder || null;
     this.dynoMinSpeed = spec.dynoMinSpeed ?? 1000 * ES_UNITS.rpm;
     this.dynoMaxSpeed = spec.dynoMaxSpeed ?? spec.redline;
     this.dynoHoldStep = spec.dynoHoldStep ?? 100 * ES_UNITS.rpm;
@@ -1172,24 +1173,41 @@ class ESSynthesizerCore {
 }
 /* ---------------------------------------------------------------- Vibration */
 
+// Not in engine-sim, which is 2D: where each cylinder sits along the
+// crankshaft. Cylinders go front to back in the engine's axialOrder, or by
+// journal; ones sharing a journal sit one bore and a fifth apart, the next
+// journal a quarter bore further. Returns metres from the middle, per cylinder.
+function esAxialPositions(engine) {
+  const cyls = engine.cylinders, unit = 1.2 * Math.max(...engine.banks.map(b => b.bore));
+  const order = engine.axialOrder || cyls.map((c, i) => i).sort((a, b) => cyls[a].journal - cyls[b].journal || cyls[a].bank.index - cyls[b].bank.index);
+  const z = new Float64Array(cyls.length);
+  let pos = 0;
+  order.forEach((i, k) => {
+    if (k > 0) pos += cyls[i].journal === cyls[order[k - 1]].journal ? unit : 1.25 * unit;
+    z[i] = pos;
+  });
+  for (let i = 0; i < z.length; i++) z[i] -= pos / 2;
+  return { z, unit };
+}
+
 // Not in engine-sim. Free shaking forces and rocking moments of the
 // reciprocating masses (piston plus a third of the rod), from the engine's own
 // slider-crank geometry over one 720° cycle, split into crank orders. An order
 // k vibrates at k × rpm / 60 Hz. The first order part that turns with the crank
 // is left out, since crank counterweights cancel it; what is left needs a
-// balance shaft or is felt. Journals are taken 1.25 bores apart for moments.
+// balance shaft or is felt. Moments use esAxialPositions.
 // The firing pulses add a torque at order cylinders / 2.
 function esVibrationAnalysis(engine) {
   const N = 720, maxHalfOrder = 24, cyls = engine.cylinders, nJ = engine.crank.journals.length;
   const m = engine.pistonSpec.mass + engine.rodSpec.mass / 3, r = engine.crank.throw;
-  const pitch = 1.25 * Math.max(...engine.banks.map(b => b.bore));
+  const axial = esAxialPositions(engine), pitch = axial.unit;
   const theta0 = engine.theta;
   const fx = new Float64Array(N), fy = new Float64Array(N), mx = new Float64Array(N), my = new Float64Array(N);
   for (let n = 0; n < N; n++) {
     engine.theta = 2 * ES_TAU * n / N;
     engine.computeGeometry();
     for (const c of cyls) {
-      const f = m * c.dds, z = (c.journal - (nJ - 1) / 2) * pitch;
+      const f = m * c.dds, z = axial.z[c.global];
       const x = f * c.bank.dx, y = f * c.bank.dy;
       fx[n] += x; fy[n] += y; mx[n] -= z * y; my[n] += z * x;
     }
@@ -1246,6 +1264,9 @@ ES_ENGINES.subaru_ej25 = (() => {
   const cam = (lobe, base, ks) => ({ lobe, baseRadius: 17 * U.mm, lobes: ks.map(k => base + k / 4 * ES_CYCLE) });
   return {
     name: 'Subaru EJ25', starterTorque: 70 * U.lbft, starterSpeed: 500 * U.rpm, redline: 6500 * U.rpm,
+    // Not in the script (engine-sim is 2D): cylinders front to back, so that
+    // the crank reads 0-180-180-0 with the banks alternating, as on the EJ.
+    axialOrder: [0, 2, 1, 3],
     throttleGamma: 2, hfGain: 0.01, noise: 1.0, jitter: 0.5, simulationFrequency: 20000,
     fuel: { maxBurningEfficiency: 0.9, turbulenceToFlameSpeedRatio: esTurbulence(x => x < 15 ? 1.5 : x < 20 ? 1.1 * 1.5 : 1.25 * 1.5) },
     crankshaft: {
@@ -1458,6 +1479,6 @@ const ES_ENGINE_ORDER = ['subaru_ej25', 'honda_b18c5', 'v6_60', 'gm_ls'];
 if (typeof module !== 'undefined') {
   module.exports = {
     ES_ENGINES, ES_ENGINE_ORDER, ES_UNITS, ES_ATM, ESSimulator, ESEngine, ESSynthesizerInput, ESSynthesizerCore,
-    ESConvolution, ESFFT, ESButterworth, ESJitter, esImpulseResponse, esVibrationAnalysis, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicCamLobe,
+    ESConvolution, ESFFT, ESButterworth, ESJitter, esImpulseResponse, esVibrationAnalysis, esAxialPositions, ESGasSystem, esFlow, esFlowRate, esKCarb, esK28, esHarmonicCamLobe,
   };
 }

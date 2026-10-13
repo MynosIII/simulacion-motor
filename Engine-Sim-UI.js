@@ -1061,107 +1061,115 @@ class ESScene {
 
 /* ------------------------------------------------------- Crankshaft view */
 
-// Not in engine-sim: the engine seen with the crankshaft lying across the
-// screen, so every cylinder is visible at once. Each bank is turned to face
-// the viewer. Positions are the simulator's, projected on the bank's cylinder
-// axis; journals are spaced one bore and a quarter apart.
+// Not in engine-sim: the engine seen from the side, with the crankshaft
+// lying across the screen and every cylinder at once. It is an orthographic
+// projection of the simulator's own positions onto one view axis: straight
+// up the cylinders of an inline engine, up the middle of a V (both banks seen
+// slightly foreshortened), and along the cylinders of a boxer, which then
+// shows one bank above the crankshaft and the other below it, as seen from
+// above. Cylinders sit along the crank where esAxialPositions puts them.
 class ESCrankView extends ESUiElement {
   constructor(app) { super(app); }
   render() {
     const app = this.app, e = app.simulator.engine, colors = app.colors, p = this.p, ctx = app.ctx, b = this.bounds;
     this.drawFrame(b, 1, colors.foreground, colors.background);
-    const banks = e.banks.slice(0, 2), crank = e.crank, r = crank.throw;
-    const cx = crank.x || 0, cy = crank.y || 0, nJ = crank.journals.length;
-    const bore = Math.max(...banks.map(k => k.bore)), pitch = bore * 1.25, lw = bore * 0.1;
+    const crank = e.crank, r = crank.throw, cx = crank.x || 0, cy = crank.y || 0;
+    const bore = Math.max(...e.banks.map(k => k.bore)), lw = bore * 0.1;
     const headH = bore * 0.35, ch = e.pistonSpec.compressionHeight, wp = e.pistonSpec.wristPinPosition || 0, skirt = bore * 0.45;
-    const top = Math.max(...banks.map(k => k.deckHeight + k.head.chamberVolume / k.boreArea)) + headH;
-    const inner = b.inset(14), iw = inner.width(), ih = inner.height() - 70;
-    // Two-bank engines (V and boxer) get one row per bank, side by side, each
-    // over its own copy of the crankshaft seen along that bank.
-    const bankLength = nJ * pitch + pitch * 0.4, gap = pitch * 0.6, below = r * 1.8;
-    const lay = { w: banks.length * bankLength + (banks.length - 1) * gap, h: top + below };
-    const ppu = Math.min(iw / lay.w, ih / lay.h), yMin = -below;
-    const ox = (inner.x0 + inner.x1) / 2, oy = inner.y0 + 30 + (ih - lay.h * ppu) / 2 - yMin * ppu;
+    const axial = esAxialPositions(e), unit = axial.unit;
+    // View axis: the sum of the bank directions, or the first bank's when
+    // they cancel (a boxer).
+    let vx = 0, vy = 0;
+    for (const k of e.banks) { vx += k.dx; vy += k.dy; }
+    if (Math.hypot(vx, vy) < 0.3) { vx = e.banks[0].dx; vy = e.banks[0].dy; }
+    const vl = Math.hypot(vx, vy); vx /= vl; vy /= vl;
+    const proj = (x, y) => (x - cx) * vx + (y - cy) * vy;
+    const bankInfo = e.banks.map(k => {
+      const h = k.head.chamberVolume / k.boreArea, base = (k.x || 0) * k.dx + (k.y || 0) * k.dy;
+      return { k: k.dx * vx + k.dy * vy, base: proj(k.x || 0, k.y || 0), deck: k.deckHeight, roof: k.deckHeight + h, liner: (1 - k.displayDepth) * k.deckHeight, along0: base };
+    });
+    let yMax = r * 1.8, yMin = -r * 1.8;
+    for (const bi of bankInfo) { const t = bi.base + (bi.roof + headH) * bi.k; yMax = Math.max(yMax, t); yMin = Math.min(yMin, t); }
+    const zs = Array.from(axial.z), zMin = Math.min(...zs) - unit * 0.7, zMax = Math.max(...zs) + unit * 1.0;
+    // Room for the title and labels above, and the readout (plus the labels
+    // of a bank pointing down) below.
+    const below = 30 + (bankInfo.some(bi => bi.k < 0) ? 26 : 0);
+    const inner = b.inset(14), iw = inner.width(), ih = inner.height() - 40 - below;
+    const ppu = Math.min(iw / (zMax - zMin), ih / (yMax - yMin));
+    const ox = (inner.x0 + inner.x1) / 2 - (zMin + zMax) / 2 * ppu, oy = inner.y0 + below + (ih - (yMax - yMin) * ppu) / 2 - yMin * ppu;
     const grey = v => esMix(colors.background, colors.foreground, v);
     const labels = [];
-    // Crankshaft seen across: main journals on the axis, and for every throw
-    // two webs out to the crank pin with counterweights opposite. Pin heights
-    // are the crank pins projected on the bank's cylinder axis.
-    const crankshaft = (x0, ux, uy) => {
-      const z = j => x0 + (j - (nJ - 1) / 2) * pitch, tw = pitch * 0.62, webT = pitch * 0.13;
-      const pinY = j => { const phi = e.theta + crank.journals[j]; return r * (Math.cos(phi) * ux + Math.sin(phi) * uy); };
-      p.begin();
-      p.line(z(0) - pitch * 0.7, 0, z(0) - tw / 2, 0, r * 0.5);
-      for (let j = 0; j + 1 < nJ; j++) p.line(z(j) + tw / 2, 0, z(j + 1) - tw / 2, 0, r * 0.5);
-      p.line(z(nJ - 1) + tw / 2, 0, z(nJ - 1) + pitch * 0.62, 0, r * 0.5);
-      p.fill(grey(0.6));
-      p.begin(); p.line(z(nJ - 1) + pitch * 0.62, -r * 1.8, z(nJ - 1) + pitch * 0.62, r * 1.8, pitch * 0.18); p.fill(grey(0.45));
-      for (let j = 0; j < nJ; j++) {
-        const y = pinY(j);
-        p.begin();
-        for (const side of [-1, 1]) {
-          const xw = z(j) + side * (tw / 2 - webT / 2);
-          p.line(xw, -0.6 * y, xw, y, webT);
-          p.circle(xw, -0.6 * y, r * 0.4);
-        }
-        p.fill(grey(0.7));
-        p.begin(); p.line(z(j) - tw / 2 + webT, y, z(j) + tw / 2 - webT, y, r * 0.5); p.fill(grey(0.85));
-      }
-    };
 
     ctx.save();
     ctx.beginPath(); ctx.rect(b.x0, b.y0, b.width(), b.height()); ctx.clip();
     ctx.translate(ox, oy); ctx.scale(ppu, ppu);
 
-    banks.forEach((bank, bi) => {
-      const sign = 1, x0 = (bi - (banks.length - 1) / 2) * (bankLength + gap);
-      const z = j => x0 + (j - (nJ - 1) / 2) * pitch;
-      crankshaft(x0, bank.dx, bank.dy);
-      const along = (x, y) => (x - cx) * bank.dx + (y - cy) * bank.dy;
-      const h = bank.head.chamberVolume / bank.boreArea, base = along(bank.x || 0, bank.y || 0);
-      const deck = base + bank.deckHeight, roof = deck + h, liner = base + (1 - bank.displayDepth) * bank.deckHeight;
-      const js = bank.cylinders.map(c => c.journal);
-      const z0 = z(Math.min(...js)) - pitch / 2, z1 = z(Math.max(...js)) + pitch / 2;
-      // Cylinder head across the bank.
-      p.begin(); p.line(z0, sign * (roof + headH / 2), z1, sign * (roof + headH / 2), headH); p.fill(grey(0.3));
-      for (const cyl of bank.cylinders) {
-        const i = cyl.global, x = z(cyl.journal), chamber = e.chambers[i];
-        const pin = along(cyl.pinX, cyl.pinY), crankPin = along(cyl.journalX, cyl.journalY);
-        const wall = bank.bore / 2 + lw / 2, crown = pin + ch + wp;
-        // Liner walls.
-        p.begin();
-        p.line(x - wall, sign * liner, x - wall, sign * roof, lw);
-        p.line(x + wall, sign * liner, x + wall, sign * roof, lw);
-        p.fill(colors.pink);
-        // Gas above the piston: fresh mixture blue, burned gas grey, flame orange.
-        p.begin(); p.line(x, sign * crown, x, sign * roof, bank.bore); p.fill(esChamberGasColor(app, chamber));
-        if (chamber.lit) {
-          const depth = Math.min(chamber.flame.travelY, roof - crown), width = Math.min(chamber.flame.travelX * 2, bank.bore);
-          p.begin(); p.line(x, sign * roof, x, sign * (roof - depth), width); p.fill(colors.orange.slice(0, 3).concat([0.8]));
-        }
-        // Connecting rod, piston and wrist pin.
-        p.begin(); p.line(x, sign * crankPin, x, sign * pin, r * 0.45); p.fill(grey(0.9333));
-        p.begin(); p.line(x, sign * (pin - skirt), x, sign * crown, bank.bore * 0.96); p.fill(colors.foreground);
-        p.begin(); p.circle(x, sign * pin, bank.bore / 10 * 0.75); p.fill(colors.background);
-        labels.push([String(i + 1), ox + x * ppu, oy + (roof + headH + bore * 0.12) * ppu, chamber.lit]);
+    // Crankshaft: one throw per journal, under the cylinders riding on it,
+    // with main journals between throws and the flywheel at the back.
+    const throws = new Map();
+    for (const c of e.cylinders) {
+      const t = throws.get(c.journal) || { z0: Infinity, z1: -Infinity, angle: c.journalAngle };
+      t.z0 = Math.min(t.z0, axial.z[c.global]); t.z1 = Math.max(t.z1, axial.z[c.global]);
+      throws.set(c.journal, t);
+    }
+    const list = [...throws.values()].sort((a, c) => a.z0 - c.z0), webT = unit * 0.13, half = unit * 0.36;
+    p.begin();
+    let zPrev = zMin;
+    for (const t of list) { p.line(zPrev, 0, t.z0 - half, 0, r * 0.5); zPrev = t.z1 + half; }
+    p.line(zPrev, 0, zMax - unit * 0.2, 0, r * 0.5);
+    p.fill(grey(0.6));
+    p.begin(); p.line(zMax - unit * 0.2, -r * 1.8, zMax - unit * 0.2, r * 1.8, unit * 0.16); p.fill(grey(0.45));
+    for (const t of list) {
+      const phi = e.theta + t.angle, y = r * (Math.cos(phi) * vx + Math.sin(phi) * vy);
+      p.begin();
+      for (const zw of [t.z0 - half + webT / 2, t.z1 + half - webT / 2]) {
+        p.line(zw, -0.6 * y, zw, y, webT);
+        p.circle(zw, -0.6 * y, r * 0.4);
       }
-    });
+      p.fill(grey(0.7));
+      p.begin(); p.line(t.z0 - half + webT, y, t.z1 + half - webT, y, r * 0.5); p.fill(grey(0.85));
+    }
+
+    // Cylinders, back bank first so the one nearer the viewer stays on top.
+    const order = e.cylinders.slice().sort((a, c) => c.bank.index - a.bank.index);
+    for (const cyl of order) {
+      const bi = bankInfo[cyl.bank.index], k = bi.k, x = axial.z[cyl.global], chamber = e.chambers[cyl.global];
+      const at = d => bi.base + d * k;
+      const pin = proj(cyl.pinX, cyl.pinY), pinAlong = (pin - bi.base) / k, crankPin = proj(cyl.journalX, cyl.journalY);
+      const crown = pinAlong + ch + wp, wall = cyl.bank.bore / 2 + lw / 2;
+      p.begin();
+      p.line(x - wall, at(bi.liner), x - wall, at(bi.roof), lw);
+      p.line(x + wall, at(bi.liner), x + wall, at(bi.roof), lw);
+      p.fill(colors.pink);
+      p.begin(); p.line(x - wall - lw / 2, at(bi.roof + headH / 2), x + wall + lw / 2, at(bi.roof + headH / 2), headH * Math.abs(k)); p.fill(grey(0.3));
+      // Gas above the piston: fresh mixture blue, burned gas grey, flame orange.
+      p.begin(); p.line(x, at(crown), x, at(bi.roof), cyl.bank.bore); p.fill(esChamberGasColor(app, chamber));
+      if (chamber.lit) {
+        const depth = Math.min(chamber.flame.travelY, bi.roof - crown), width = Math.min(chamber.flame.travelX * 2, cyl.bank.bore);
+        p.begin(); p.line(x, at(bi.roof), x, at(bi.roof - depth), width); p.fill(colors.orange.slice(0, 3).concat([0.8]));
+      }
+      p.begin(); p.line(x, crankPin, x, pin, r * 0.45); p.fill(grey(0.9333));
+      p.begin(); p.line(x, at(pinAlong - skirt), x, at(crown), cyl.bank.bore * 0.96); p.fill(colors.foreground);
+      p.begin(); p.circle(x, pin, cyl.bank.bore / 10 * 0.75); p.fill(colors.background);
+      const ly = at(bi.roof + headH) + Math.sign(k) * bore * 0.15;
+      labels.push([String(cyl.global + 1), ox + x * ppu, oy + ly * ppu + (k < 0 ? -18 : 0), chamber.lit]);
+    }
     ctx.restore();
     for (const [t, x, y, lit] of labels) {
       const w = p.textWidth(t, 18);
       p.text(t, x - w / 2, y, 18, lit ? colors.orange : colors.foreground);
     }
     this.drawText('CRANKSHAFT VIEW', b.inset(10), 16);
-    const order = app.simulator.firingOrder().map(i => i + 1).join('-');
-    this.drawAlignedText('FIRING ORDER ' + order, b.inset(10), 16, [1, 1], [1, 1]);
+    const firing = app.simulator.firingOrder().map(i => i + 1).join('-');
+    this.drawAlignedText('FIRING ORDER ' + firing, b.inset(10), 16, [1, 1], [1, 1]);
     const v = app.vibrationNow();
-    this.drawText(`VIBRATION ${esFixed(v.hz, 1)} HZ  ORDER ${v.order} ${v.kind.toUpperCase()}`, ESBounds.sized(b.width() - 20, 26, b.x0 + 10, b.y0 + 26, ESRef.tl), 16);
-    // Legend.
-    const lx = b.x1 - 10;
-    let x = lx;
+    const text = v.rps < 1 ? `VIBRATION  ORDER ${v.order} ${v.kind.toUpperCase()} (ENGINE STOPPED)`
+      : `VIBRATION ${esFixed(v.hz, 1)} HZ  ORDER ${v.order} ${v.kind.toUpperCase()}`;
+    this.drawText(text, ESBounds.sized(b.width() - 20, 26, b.x0 + 10, b.y0 + 26, ESRef.tl), 16);
+    let lx = b.x1 - 10;
     for (const [t, c] of [['FLAME', colors.orange], ['EXHAUST', esMix(colors.background, colors.foreground, 0.4)], ['MIXTURE', colors.blue]]) {
       const w = p.textWidth(t, 14);
-      x -= w; p.text(t, x, b.y0 + 12, 14, c); x -= 16;
+      lx -= w; p.text(t, lx, b.y0 + 12, 14, c); lx -= 16;
     }
   }
 }
